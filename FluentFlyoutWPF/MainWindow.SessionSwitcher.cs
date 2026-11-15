@@ -69,21 +69,17 @@ public partial class MainWindow
             string trackLabel = string.Empty;
             try
             {
-                if (session is ZenMediaPlaybackSession zenSession)
-                {
-                    if (!string.IsNullOrWhiteSpace(zenSession.Title) || !string.IsNullOrWhiteSpace(zenSession.Artist))
-                        trackLabel = string.IsNullOrWhiteSpace(zenSession.Artist) ? zenSession.Title : $"{zenSession.Title} - {zenSession.Artist}";
-                }
-                else if (session is VlcMediaPlaybackSession vlcSession)
-                {
-                    if (!string.IsNullOrWhiteSpace(vlcSession.Title) || !string.IsNullOrWhiteSpace(vlcSession.Artist))
-                        trackLabel = string.IsNullOrWhiteSpace(vlcSession.Artist) ? vlcSession.Title : $"{vlcSession.Title} - {vlcSession.Artist}";
-                }
-                else if (session is SmtcMediaPlaybackSession smtcSession && smtcSession.RawSession.ControlSession != null)
+                if (session is SmtcMediaPlaybackSession smtcSession && smtcSession.RawSession.ControlSession != null)
                 {
                     var props = TryGetMediaProperties(smtcSession.RawSession.ControlSession);
                     if (props != null && (!string.IsNullOrWhiteSpace(props.Title) || !string.IsNullOrWhiteSpace(props.Artist)))
                         trackLabel = string.IsNullOrWhiteSpace(props.Artist) ? props.Title : $"{props.Title} - {props.Artist}";
+                }
+                else if (!string.IsNullOrWhiteSpace(session.CachedTitle) || !string.IsNullOrWhiteSpace(session.CachedArtist))
+                {
+                    trackLabel = string.IsNullOrWhiteSpace(session.CachedArtist)
+                        ? session.CachedTitle
+                        : $"{session.CachedTitle} - {session.CachedArtist}";
                 }
             }
             catch (Exception ex)

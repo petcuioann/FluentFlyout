@@ -46,6 +46,9 @@ public sealed class VlcMediaPlaybackSession : IMediaPlaybackSession
     public string Title { get; internal set; } = string.Empty;
     public string Artist { get; internal set; } = string.Empty;
     public string ArtworkUrl { get; internal set; } = string.Empty;
+    public string CachedTitle => Title;
+    public string CachedArtist => Artist;
+    public string CachedArtworkUrl => ArtworkUrl;
 
     public Task<(string Title, string Artist, IRandomAccessStreamReference? SmtcThumbnail, string? ArtworkUrl)> GetMetadataAsync(CancellationToken token = default)
         => Task.FromResult<(string, string, IRandomAccessStreamReference?, string?)>((Title, Artist, null, ArtworkUrl));
@@ -121,14 +124,17 @@ public sealed class VlcBridgeService : IDisposable
 
     private async Task PollLoopAsync(CancellationToken token)
     {
-        using PeriodicTimer timer = new(TimeSpan.FromMilliseconds(1000));
-        while (!token.IsCancellationRequested && await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+        bool wasRunning = false;
+        while (!token.IsCancellationRequested)
         {
             try
             {
+                await Task.Delay(wasRunning ? 1000 : 3000, token).ConfigureAwait(false);
+
                 var procs = Process.GetProcessesByName("vlc");
                 bool vlcRunning = procs.Length > 0;
                 foreach (var p in procs) p.Dispose();
+                wasRunning = vlcRunning;
 
                 if (!vlcRunning)
                 {
@@ -265,6 +271,8 @@ public sealed class VlcBridgeService : IDisposable
             using MemoryStream ms = new();
             await stream.CopyToAsync(ms, token).ConfigureAwait(false);
             string dataUrl = "data:image/png;base64," + Convert.ToBase64String(ms.ToArray());
+            if (_fileThumbnailDataUrlCache.Count >= 64)
+                _fileThumbnailDataUrlCache.Clear();
             _fileThumbnailDataUrlCache[cacheKey] = dataUrl;
             return dataUrl;
         }

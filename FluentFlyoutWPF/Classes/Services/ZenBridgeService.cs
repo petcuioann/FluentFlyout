@@ -51,6 +51,9 @@ public sealed class ZenMediaPlaybackSession : IMediaPlaybackSession
     public string Title { get; private set; } = string.Empty;
     public string Artist { get; private set; } = string.Empty;
     public string ArtworkUrl { get; private set; } = string.Empty;
+    public string CachedTitle => Title;
+    public string CachedArtist => Artist;
+    public string CachedArtworkUrl => ArtworkUrl;
 
     public void Update(string connectionId, ZenBridgeSessionDto dto)
     {
@@ -196,12 +199,8 @@ public sealed class ZenBridgeService : IDisposable
                 if (!context.Request.IsWebSocketRequest)
                 {
                     string rawUrl = context.Request.RawUrl ?? string.Empty;
-                    if (rawUrl.StartsWith("/diag", StringComparison.OrdinalIgnoreCase))
-                    {
-                        Logger.Info("ZenBridge diag: " + rawUrl);
-                    }
-                    else if (string.Equals(context.Request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase) &&
-                             rawUrl.StartsWith("/sync", StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(context.Request.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase) &&
+                        rawUrl.StartsWith("/sync", StringComparison.OrdinalIgnoreCase))
                     {
                         using StreamReader reader = new(context.Request.InputStream, Encoding.UTF8);
                         string body = await reader.ReadToEndAsync(token);

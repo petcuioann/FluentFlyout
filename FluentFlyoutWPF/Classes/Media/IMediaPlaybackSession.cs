@@ -26,6 +26,9 @@ public interface IMediaPlaybackSession
     bool CanShuffle { get; }
     MediaPlaybackAutoRepeatMode AutoRepeatMode { get; }
     bool? IsShuffleActive { get; }
+    string CachedTitle => string.Empty;
+    string CachedArtist => string.Empty;
+    string CachedArtworkUrl => string.Empty;
 
     Task<(string Title, string Artist, IRandomAccessStreamReference? SmtcThumbnail, string? ArtworkUrl)> GetMetadataAsync(CancellationToken token = default);
     Task<bool> TryTogglePlayPauseAsync();

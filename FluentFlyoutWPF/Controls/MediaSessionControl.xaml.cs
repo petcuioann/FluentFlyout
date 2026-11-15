@@ -29,9 +29,6 @@ public partial class MediaSessionControl : UserControl
     private string? _lastTitle;
     private string? _lastArtist;
     private int _lastThumbnailHash = -1;
-    private string? _lastPlayerId;
-    private string? _lastPlayerName;
-    private ImageSource? _lastPlayerIcon;
 
     public MediaSessionControl()
     {
@@ -220,7 +217,6 @@ public partial class MediaSessionControl : UserControl
         _lastTitle = "No media playing";
         _lastArtist = string.Empty;
         _lastThumbnailHash = 0;
-        _lastPlayerId = null;
 
         SongTitle.Text = _lastTitle;
         SongArtist.Text = string.Empty;

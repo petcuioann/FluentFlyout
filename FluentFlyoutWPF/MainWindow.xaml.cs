@@ -509,13 +509,9 @@ public partial class MainWindow : MicaWindow
         {
             if (GetActiveMediaSession() is { } activeSession)
             {
-                string? title = activeSession switch
-                {
-                    SmtcMediaPlaybackSession smtc => TryGetMediaProperties(smtc.RawSession.ControlSession)?.Title,
-                    ZenMediaPlaybackSession zen => zen.Title,
-                    VlcMediaPlaybackSession vlc => vlc.Title,
-                    _ => null
-                };
+                string? title = activeSession is SmtcMediaPlaybackSession smtc
+                    ? TryGetMediaProperties(smtc.RawSession.ControlSession)?.Title
+                    : activeSession.CachedTitle;
                 return await activeSession.TryActivateAsync(title);
             }
         }
@@ -831,12 +827,11 @@ public partial class MainWindow : MicaWindow
         }
         else
         {
-            var (title, artist, artUrl, status, sessionId) = activeSession switch
-            {
-                ZenMediaPlaybackSession z => (z.Title, z.Artist, z.ArtworkUrl, z.PlaybackStatus, z.Id),
-                VlcMediaPlaybackSession v => (v.Title, v.Artist, v.ArtworkUrl, v.PlaybackStatus, v.Id),
-                _ => (string.Empty, string.Empty, string.Empty, activeSession.PlaybackStatus, activeSession.Id)
-            };
+            string title = activeSession.CachedTitle;
+            string artist = activeSession.CachedArtist;
+            string artUrl = activeSession.CachedArtworkUrl;
+            var status = activeSession.PlaybackStatus;
+            string sessionId = activeSession.Id;
 
             taskbarWindow?.UpdateUi(title, artist, null, status);
 
