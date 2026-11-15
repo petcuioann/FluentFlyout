@@ -5,10 +5,10 @@ This is a custom fork of the original FluentFlyout project. Compared to the main
 <p align="center">
 	<img alt="FluentFlyout multi-session flyout sample" src="sample.png" />
 </p>
-- **Multiple Media Sessions Flyout:** Stacks and displays all currently playing media sessions simultaneously in the flyout (no dropdown or internal scrollbar), smoothly resizing height to fit. Paused sessions are automatically hidden whenever media is playing; if all sessions are paused, only the last paused item is kept as a placeholder until resumed, replaced, or closed.
+- **Multiple Media Sessions Flyout:** Stacks and displays all active and paused media sessions simultaneously in the flyout (no dropdown or internal scrollbar), smoothly resizing height to fit.
 - **Zen Browser Multi-Tab Support:** Exposes each active media tab in Zen Browser individually (e.g. YouTube, Spotify, YouTube Music) instead of collapsing them into a single `Zen Browser` session.
 - **VLC Media Player Integration:** Displays active VLC playback, video/file thumbnails, and controls (`Play/Pause`, `Prev`, `Next`, `-5s`/`+5s`, `Repeat`, `Shuffle`) via VLC's local HTTP interface (`127.0.0.1:42129`).
-- **Scrollable Taskbar Widget:** Scroll over the taskbar widget to switch between currently playing media sessions.
+- **Scrollable Taskbar Widget & Last-Paused Placeholder:** Scroll over the taskbar widget to switch between currently playing media sessions. Paused sessions are omitted from the widget when other media is playing; if all sessions are paused, only the last paused item stays as a placeholder until resumed, replaced, or closed.
 - **Flyout Seek Controls (`-5s` / `+5s`):** Added 5-second rewind and fast-forward buttons to each session card.
 - **Cleaner Compact Layout:** Removed the player source badge button (`MediaIdButton`) from each card and scaled the flyout width to fit the remaining controls cleanly.
 - **BUG FIX — Windhawk `Taskbar Auto-Hide Instant Show` Compatibility:** Correctly renders the taskbar widget inside the taskbar without glitchy, clipped, or off-screen positioning.

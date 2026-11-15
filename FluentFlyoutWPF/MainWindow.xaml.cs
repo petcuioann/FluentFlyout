@@ -1447,7 +1447,7 @@ public partial class MainWindow : MicaWindow
                 ToggleBlur();
             }
 
-            validSessions = GetAllowedPlaybackSessions().ToList();
+            validSessions = GetRawAllowedPlaybackSessions();
 
             if (validSessions.Count == 0)
             {
