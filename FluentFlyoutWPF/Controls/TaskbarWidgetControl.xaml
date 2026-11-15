@@ -16,7 +16,7 @@
             MouseEnter="Grid_MouseEnter"
             MouseLeave="Grid_MouseLeave"
             MouseLeftButtonUp="Grid_MouseLeftButtonUp"
-            MouseWheel="MainBorder_MouseWheel"
+            PreviewMouseWheel="MainBorder_PreviewMouseWheel"
             ClipToBounds="True">
         <Grid>
             <Image x:Name="BackgroundImage" Stretch="UniformToFill" HorizontalAlignment="Center" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5" Opacity="0.4">

@@ -256,22 +256,12 @@ public partial class TaskbarWidgetControl : UserControl
         _mainWindow.ShowMediaFlyout(toggleMode: true, forceShow: true, withVolume: true);
     }
 
-    private void MainBorder_MouseWheel(object sender, MouseWheelEventArgs e)
+    private void MainBorder_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
     {
         if (_mainWindow == null) return;
 
-        if (SettingsManager.Current.TaskbarWidgetScrollVolumeMode == 0
-            || Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
-        {
-            int direction = e.Delta > 0 ? -1 : 1;
-            _mainWindow.CycleActiveMediaSession(direction);
-        }
-        else
-        {
-            float volumeDelta = Math.Clamp(e.Delta / 120f * TaskbarVolumeStep, -1f, 1f);
-            _mainWindow.AdjustTaskbarVolume(volumeDelta);
-        }
-
+        int direction = e.Delta > 0 ? -1 : 1;
+        _mainWindow.CycleActiveMediaSession(direction);
         e.Handled = true;
     }
 
@@ -509,7 +499,15 @@ public partial class TaskbarWidgetControl : UserControl
         }
     }
 
-    public void UpdateUi(string title, string artist, BitmapImage? icon, GlobalSystemMediaTransportControlsSessionPlaybackStatus? playbackStatus, GlobalSystemMediaTransportControlsSessionPlaybackControls? playbackControls = null)
+    public void UpdateUi(
+        string title,
+        string artist,
+        BitmapImage? icon,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus? playbackStatus,
+        GlobalSystemMediaTransportControlsSessionPlaybackControls? playbackControls = null,
+        bool? canPrevious = null,
+        bool? canPlayPause = null,
+        bool? canNext = null)
     {
         if (title == "-" && artist == "-")
         {
@@ -556,15 +554,21 @@ public partial class TaskbarWidgetControl : UserControl
         // adjust UI based on available controls
         Dispatcher.Invoke(() =>
         {
-            if (SettingsManager.Current.TaskbarWidgetControlsEnabled && playbackControls != null)
+            if (SettingsManager.Current.TaskbarWidgetControlsEnabled && (playbackControls != null || canPlayPause.HasValue))
             {
-                PreviousButton.IsHitTestVisible = playbackControls.IsPreviousEnabled;
-                PlayPauseButton.IsHitTestVisible = playbackControls.IsPauseEnabled || playbackControls.IsPlayEnabled;
-                NextButton.IsHitTestVisible = playbackControls.IsNextEnabled;
+                bool prevEnabled = playbackControls?.IsPreviousEnabled ?? (canPrevious ?? false);
+                bool playPauseEnabled = playbackControls != null
+                    ? (playbackControls.IsPauseEnabled || playbackControls.IsPlayEnabled)
+                    : (canPlayPause ?? false);
+                bool nextEnabled = playbackControls?.IsNextEnabled ?? (canNext ?? false);
 
-                PreviousButton.Opacity = playbackControls.IsPreviousEnabled ? 1 : 0.5;
-                PlayPauseButton.Opacity = (playbackControls.IsPauseEnabled || playbackControls.IsPlayEnabled) ? 1 : 0.5;
-                NextButton.Opacity = playbackControls.IsNextEnabled ? 1 : 0.5;
+                PreviousButton.IsHitTestVisible = prevEnabled;
+                PlayPauseButton.IsHitTestVisible = playPauseEnabled;
+                NextButton.IsHitTestVisible = nextEnabled;
+
+                PreviousButton.Opacity = prevEnabled ? 1 : 0.5;
+                PlayPauseButton.Opacity = playPauseEnabled ? 1 : 0.5;
+                NextButton.Opacity = nextEnabled ? 1 : 0.5;
             }
             else
             {

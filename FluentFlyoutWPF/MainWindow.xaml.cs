@@ -73,6 +73,9 @@ public partial class MainWindow : MicaWindow
 
     private readonly Lock _sessionHistoryLock = new();
     private readonly List<string> _sessionHistory = [];
+    private readonly HashSet<string> _knownRawSessionIds = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _knownPlayingIds = new(StringComparer.Ordinal);
+    private string? _lastPausedPlaceholderId;
     private readonly Dictionary<string, MediaSessionControl> _sessionControls = [];
     private MediaSessionControl? _noMediaControl;
     private CancellationTokenSource? _flyoutMetadataCts;
@@ -307,7 +310,7 @@ public partial class MainWindow : MicaWindow
         }
     }
 
-    public IReadOnlyList<IMediaPlaybackSession> GetAllowedPlaybackSessions()
+    private List<IMediaPlaybackSession> GetRawAllowedPlaybackSessions()
     {
         var rawZenSessions = _zenBridgeService.GetSessions();
         bool hasZenSessions = rawZenSessions.Count > 0;
@@ -343,6 +346,76 @@ public partial class MainWindow : MicaWindow
         return sessions;
     }
 
+    public IReadOnlyList<IMediaPlaybackSession> GetAllowedPlaybackSessions()
+    {
+        var rawSessions = GetRawAllowedPlaybackSessions();
+        var playingSessions = rawSessions.Where(s => s.IsPlaying).ToList();
+
+        lock (_sessionHistoryLock)
+        {
+            var newRawSessions = rawSessions.Where(s => !_knownRawSessionIds.Contains(s.Id)).ToList();
+
+            _knownRawSessionIds.Clear();
+            foreach (var s in rawSessions)
+                _knownRawSessionIds.Add(s.Id);
+
+            _sessionHistory.RemoveAll(id => !_knownRawSessionIds.Contains(id));
+
+            if (playingSessions.Count > 0)
+            {
+                _knownPlayingIds.Clear();
+                foreach (var s in playingSessions)
+                    _knownPlayingIds.Add(s.Id);
+
+                _lastPausedPlaceholderId = null;
+                return playingSessions;
+            }
+
+            if (rawSessions.Count == 0)
+            {
+                _knownPlayingIds.Clear();
+                _lastPausedPlaceholderId = null;
+                return [];
+            }
+
+            if (_knownPlayingIds.Count > 0)
+            {
+                var justPaused = rawSessions.Where(s => _knownPlayingIds.Contains(s.Id)).ToList();
+                _knownPlayingIds.Clear();
+
+                if (justPaused.Count > 0)
+                {
+                    var chosen = _sessionHistory
+                        .Select(id => justPaused.FirstOrDefault(s => s.Id == id))
+                        .FirstOrDefault(s => s != null) ?? justPaused[0];
+                    _lastPausedPlaceholderId = chosen.Id;
+                    _sessionHistory.Remove(chosen.Id);
+                    _sessionHistory.Insert(0, chosen.Id);
+                }
+            }
+            else if (newRawSessions.Count > 0)
+            {
+                var chosen = _sessionHistory
+                    .Select(id => newRawSessions.FirstOrDefault(s => s.Id == id))
+                    .FirstOrDefault(s => s != null) ?? newRawSessions[0];
+                _lastPausedPlaceholderId = chosen.Id;
+                _sessionHistory.Remove(chosen.Id);
+                _sessionHistory.Insert(0, chosen.Id);
+            }
+
+            if (!string.IsNullOrEmpty(_lastPausedPlaceholderId))
+            {
+                var placeholder = rawSessions.FirstOrDefault(s => s.Id == _lastPausedPlaceholderId);
+                if (placeholder != null)
+                    return [placeholder];
+
+                _lastPausedPlaceholderId = null;
+            }
+
+            return [];
+        }
+    }
+
     // display names are matched in full: entries always hold a whole app name, and a substring match let one entry
     // swallow others (blocking "Amazon Music" also blocked "Amazon Music SMTC Bridge"). the session id keeps substring
     // matching so an entry can still target a whole package or publisher
@@ -353,13 +426,15 @@ public partial class MainWindow : MicaWindow
         return appName.Equals(entry, StringComparison.OrdinalIgnoreCase) || appId.Contains(entry, StringComparison.OrdinalIgnoreCase);
     }
 
-    private void PromoteSessionHistory(string sessionId)
+    private void PromoteSessionHistory(string sessionId, bool isPlaying = false)
     {
         if (string.IsNullOrEmpty(sessionId)) return;
         lock (_sessionHistoryLock)
         {
             _sessionHistory.Remove(sessionId);
             _sessionHistory.Insert(0, sessionId);
+            if (isPlaying)
+                _knownPlayingIds.Add(sessionId);
         }
     }
 
@@ -369,29 +444,27 @@ public partial class MainWindow : MicaWindow
         lock (_sessionHistoryLock)
         {
             _sessionHistory.Remove(sessionId);
+            _knownRawSessionIds.Remove(sessionId);
+            _knownPlayingIds.Remove(sessionId);
+            if (string.Equals(_lastPausedPlaceholderId, sessionId, StringComparison.Ordinal))
+                _lastPausedPlaceholderId = null;
         }
     }
 
     public void CycleActiveMediaSession(int direction)
     {
-        var validSessions = GetAllowedPlaybackSessions().ToList();
-        var playingSessions = validSessions.Where(s => s.IsPlaying).ToList();
-
-        var cycleList = playingSessions.Count >= 2
-            ? playingSessions
-            : (playingSessions.Count == 0 && validSessions.Count >= 2 ? validSessions : null);
-
-        if (cycleList == null) return;
+        var playingSessions = GetAllowedPlaybackSessions().Where(s => s.IsPlaying).ToList();
+        if (playingSessions.Count < 2) return;
 
         string? currentActiveId = GetActiveMediaSession()?.Id;
-        int currentIndex = cycleList.FindIndex(s => s.Id == currentActiveId);
+        int currentIndex = playingSessions.FindIndex(s => s.Id == currentActiveId);
         if (currentIndex < 0) currentIndex = 0;
 
-        int newIndex = ((currentIndex + direction) % cycleList.Count + cycleList.Count) % cycleList.Count;
-        var nextSession = cycleList[newIndex];
+        int newIndex = ((currentIndex + direction) % playingSessions.Count + playingSessions.Count) % playingSessions.Count;
+        var nextSession = playingSessions[newIndex];
 
         SettingsManager.Current.PinnedSessionId = string.Empty;
-        PromoteSessionHistory(nextSession.Id);
+        PromoteSessionHistory(nextSession.Id, isPlaying: true);
         UpdateTaskbar();
 
         if (IsVisible)
@@ -832,8 +905,11 @@ public partial class MainWindow : MicaWindow
             string artUrl = activeSession.CachedArtworkUrl;
             var status = activeSession.PlaybackStatus;
             string sessionId = activeSession.Id;
+            bool canPrev = activeSession.CanPrevious;
+            bool canPlayPause = activeSession.CanPlayPause;
+            bool canNext = activeSession.CanNext;
 
-            taskbarWindow?.UpdateUi(title, artist, null, status);
+            taskbarWindow?.UpdateUi(title, artist, null, status, null, canPrev, canPlayPause, canNext);
 
             if (!string.IsNullOrEmpty(artUrl))
             {
@@ -846,7 +922,7 @@ public partial class MainWindow : MicaWindow
                     {
                         if (GetActiveMediaSession() is { } current && current.Id == sessionId)
                         {
-                            taskbarWindow?.UpdateUi(title, artist, img, current.PlaybackStatus);
+                            taskbarWindow?.UpdateUi(title, artist, img, current.PlaybackStatus, null, current.CanPrevious, current.CanPlayPause, current.CanNext);
                         }
                     });
                 });
@@ -868,13 +944,13 @@ public partial class MainWindow : MicaWindow
         {
             if (_isCleaningUp) return;
 
-            var allowedSessions = GetAllowedPlaybackSessions();
+            var rawSessions = GetRawAllowedPlaybackSessions();
             foreach (string id in updatedIds)
             {
-                var updated = allowedSessions.FirstOrDefault(s => s.Id == id);
+                var updated = rawSessions.FirstOrDefault(s => s.Id == id);
                 if (updated != null && updated.IsPlaying)
                 {
-                    PromoteSessionHistory(updated.Id);
+                    PromoteSessionHistory(updated.Id, isPlaying: true);
                     pauseOtherMediaSessionsIfNeeded(updated);
                 }
             }
@@ -936,7 +1012,7 @@ public partial class MainWindow : MicaWindow
 
         if (newStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
         {
-            PromoteSessionHistory(mediaSession.Id);
+            PromoteSessionHistory(mediaSession.Id, isPlaying: true);
         }
         else if (newStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused)
         {
@@ -944,12 +1020,12 @@ public partial class MainWindow : MicaWindow
 
             if (GetActiveMediaSession()?.Id == mediaSession.Id)
             {
-                var otherPlaying = GetAllowedPlaybackSessions()
+                var otherPlaying = GetRawAllowedPlaybackSessions()
                     .FirstOrDefault(s => s.Id != mediaSession.Id && s.IsPlaying);
 
                 if (otherPlaying != null)
                 {
-                    PromoteSessionHistory(otherPlaying.Id);
+                    PromoteSessionHistory(otherPlaying.Id, isPlaying: true);
                 }
             }
         }
