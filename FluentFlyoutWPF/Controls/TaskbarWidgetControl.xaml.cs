@@ -258,7 +258,15 @@ public partial class TaskbarWidgetControl : UserControl
 
     private void MainBorder_MouseWheel(object sender, MouseWheelEventArgs e)
     {
-        if (SettingsManager.Current.TaskbarWidgetScrollVolumeMode != 0 && _mainWindow != null)
+        if (_mainWindow == null) return;
+
+        if (SettingsManager.Current.TaskbarWidgetScrollVolumeMode == 0
+            || Keyboard.Modifiers.HasFlag(ModifierKeys.Shift))
+        {
+            int direction = e.Delta > 0 ? -1 : 1;
+            _mainWindow.CycleActiveMediaSession(direction);
+        }
+        else
         {
             float volumeDelta = Math.Clamp(e.Delta / 120f * TaskbarVolumeStep, -1f, 1f);
             _mainWindow.AdjustTaskbarVolume(volumeDelta);

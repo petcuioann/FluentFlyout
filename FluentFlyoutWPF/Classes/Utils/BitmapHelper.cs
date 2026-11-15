@@ -86,7 +86,7 @@ internal static class BitmapHelper
     }
 
     private const int _maxThumbnailSize = 256; // previously 512, reduced for application memory
-    private const int _cacheEntryLimit = 5;
+    private const int _cacheEntryLimit = 8;
 
     // cached thumbnails to prevent reprocessing
     private static readonly LruCache<int, BitmapImage> _thumbnailCache = new(_cacheEntryLimit);
@@ -126,48 +126,82 @@ internal static class BitmapHelper
 
     internal static BitmapImage? GetThumbnail(IRandomAccessStreamReference? thumbnail, int maxThumbnailSize = _maxThumbnailSize)
     {
-        if (thumbnail == null)
-            return null;
-
-        int hashCode = GetStableThumbnailHash(thumbnail);
-
-        if (hashCode == 0)
-            return null;
-
-        if (_thumbnailCache.TryGetValue(hashCode, out var cachedImage) && cachedImage != null)
+        var (image, hashCode) = GetThumbnailWithHash(thumbnail, maxThumbnailSize);
+        if (hashCode != 0)
         {
             _currentHashCode = hashCode;
             _currentHashCodeContext.Value = hashCode;
-            return cachedImage;
         }
+        return image;
+    }
 
-        BitmapImage image = new();
+    internal static (BitmapImage? Image, int HashCode) GetThumbnailWithHash(IRandomAccessStreamReference? thumbnail, int maxThumbnailSize = _maxThumbnailSize)
+    {
+        if (thumbnail == null)
+            return (null, 0);
 
         try
         {
-            using (var imageStream = thumbnail.OpenReadAsync().GetAwaiter().GetResult().AsStreamForRead())
+            using var winrtStream = thumbnail.OpenReadAsync().GetAwaiter().GetResult();
+            using Stream rawStream = winrtStream.AsStreamForRead();
+
+            // Copy to a seekable stream once if the underlying WinRT stream cannot seek cleanly
+            Stream sourceStream = rawStream;
+            MemoryStream? bufferedStream = null;
+            if (!rawStream.CanSeek)
             {
-                // initialize the BitmapImage
+                bufferedStream = new MemoryStream();
+                rawStream.CopyTo(bufferedStream);
+                bufferedStream.Position = 0;
+                sourceStream = bufferedStream;
+            }
+
+            try
+            {
+                using SHA256 sha256 = SHA256.Create();
+                byte[] hashBytes = sha256.ComputeHash(sourceStream);
+                int hashCode = BitConverter.ToInt32(hashBytes, 0);
+                if (hashCode == 0)
+                    return (null, 0);
+
+                if (_thumbnailCache.TryGetValue(hashCode, out var cachedImage) && cachedImage != null)
+                    return (cachedImage, hashCode);
+
+                sourceStream.Position = 0;
+
+                BitmapImage image = new();
                 image.BeginInit();
                 image.CacheOption = BitmapCacheOption.OnLoad;
                 image.DecodePixelWidth = maxThumbnailSize;
-                image.StreamSource = imageStream;
+                image.StreamSource = sourceStream;
                 image.EndInit();
+                image.Freeze();
+
+                _thumbnailCache.Set(hashCode, image);
+                return (image, hashCode);
             }
-            image.Freeze();
+            finally
+            {
+                bufferedStream?.Dispose();
+            }
         }
         catch (Exception ex)
         {
             Logger.Info(ex, "Failed to load thumbnail image");
-            return null;
+            return (null, 0);
         }
+    }
 
-        // add bitmap to thumbnail cache with empty brush
-        _thumbnailCache.Set(hashCode, image);
+    internal static (BitmapImage? Image, int HashCode, SolidColorBrush? AccentBrush) GetThumbnailAndAccent(
+        IRandomAccessStreamReference? thumbnail,
+        int maxThumbnailSize = _maxThumbnailSize)
+    {
+        var (image, hashCode) = GetThumbnailWithHash(thumbnail, maxThumbnailSize);
+        if (image == null || hashCode == 0 || !SettingsManager.Current.UseAlbumArtAsAccentColor)
+            return (image, hashCode, null);
 
-        _currentHashCode = hashCode;
-        _currentHashCodeContext.Value = hashCode;
-        return image;
+        var brushes = ExtractDominantColorsInternal(hashCode, image, 1, 15);
+        return (image, hashCode, brushes.FirstOrDefault());
     }
 
     internal static CroppedBitmap? CropToSquare(BitmapImage? sourceImage)
@@ -217,11 +251,6 @@ internal static class BitmapHelper
             return _currentDominantColors;
         }
 
-        // start timing
-#if DEBUG
-        Stopwatch stopwatch = Stopwatch.StartNew();
-#endif
-
         try
         {
             // check if we've already calculated colors for this thumbnail by checking
@@ -238,6 +267,28 @@ internal static class BitmapHelper
                 Logger.Warn($"Thumbnail cache miss while extracting dominant colors");
                 return _currentDominantColors ?? [];
             }
+
+            _currentDominantColors = ExtractDominantColorsInternal(hashCode, sourceBitmap, colorCount, maxIterations);
+            return _currentDominantColors;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Error extracting dominant colors");
+            return [];
+        }
+    }
+
+    private static List<SolidColorBrush> ExtractDominantColorsInternal(int hashCode, BitmapImage sourceBitmap, int colorCount, int maxIterations)
+    {
+        if (_dominantColorsCache.TryGetValue(hashCode, out var cachedColors) && cachedColors != null && cachedColors.Count >= colorCount)
+            return cachedColors;
+
+#if DEBUG
+        Stopwatch stopwatch = Stopwatch.StartNew();
+#endif
+
+        try
+        {
 
             var formattedBitmap = new FormatConvertedBitmap();
             formattedBitmap.BeginInit();
@@ -434,16 +485,14 @@ internal static class BitmapHelper
                 return brush;
             }).ToList();
 
-            _currentDominantColors = brushes;
-
             // save brushes to cache with current hash as key
-            _dominantColorsCache.Set(hashCode, _currentDominantColors);
+            _dominantColorsCache.Set(hashCode, brushes);
 
 #if DEBUG
             stopwatch.Stop();
             Logger.Debug($"Dominant color extraction took {stopwatch.Elapsed.TotalMilliseconds} ms");
 #endif
-            return _currentDominantColors;
+            return brushes;
         }
         catch (Exception ex)
         {

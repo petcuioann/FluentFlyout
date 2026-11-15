@@ -309,12 +309,6 @@ public partial class UserSettings : ObservableObject
     public partial string LastKnownVersion { get; set; }
 
     /// <summary>
-    /// Show seekbar if the player supports it
-    /// </summary>
-    [ObservableProperty]
-    public partial bool SeekbarEnabled { get; set; }
-
-    /// <summary>
     /// Pause other media sessions when focusing a new one
     /// </summary>
     [ObservableProperty]
@@ -795,7 +789,6 @@ public partial class UserSettings : ObservableObject
         LockKeysBoldUi = false;
         LockKeysMonitorPreference = 0;
         LastKnownVersion = string.Empty;
-        SeekbarEnabled = false;
         PauseOtherSessionsEnabled = false;
         PinnedSessionId = string.Empty;
         LockKeysAnimated = true;

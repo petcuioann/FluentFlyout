@@ -20,14 +20,18 @@ public partial class MainWindow
     public void PinSession(string? sessionId)
     {
         SettingsManager.Current.PinnedSessionId = sessionId ?? string.Empty;
+        if (!string.IsNullOrEmpty(sessionId))
+        {
+            PromoteSessionHistory(sessionId);
+        }
         RefreshFilteredMedia();
     }
 
-    private void ShowSessionSwitcherMenu()
+    internal void ShowSessionSwitcherMenu(UIElement placementTarget)
     {
         var menu = new System.Windows.Controls.ContextMenu
         {
-            PlacementTarget = MediaIdButton,
+            PlacementTarget = placementTarget,
             Placement = System.Windows.Controls.Primitives.PlacementMode.Top
         };
 

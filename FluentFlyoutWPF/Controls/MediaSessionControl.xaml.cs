@@ -1,0 +1,393 @@
+// Copyright (c) 2024-2026 The FluentFlyout Authors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+using FluentFlyout.Classes.Settings;
+using FluentFlyout.Classes.Utils;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using Windows.Media;
+using Windows.Media.Control;
+using Wpf.Ui.Controls;
+using static WindowsMediaController.MediaManager;
+
+namespace FluentFlyoutWPF.Controls;
+
+public partial class MediaSessionControl : UserControl
+{
+    private static readonly NLog.Logger Logger = NLog.LogManager.GetCurrentClassLogger();
+    private static readonly TimeSpan SkipOffset = TimeSpan.FromSeconds(5);
+
+    public MediaSession? Session { get; private set; }
+    public string SessionId { get; private set; } = string.Empty;
+
+    public event EventHandler<UIElement>? SessionSwitcherRequested;
+    public event EventHandler? CloseFlyoutRequested;
+
+    private string? _lastTitle;
+    private string? _lastArtist;
+    private int _lastThumbnailHash = -1;
+    private string? _lastPlayerId;
+
+    public MediaSessionControl()
+    {
+        InitializeComponent();
+    }
+
+    public static int ComputeNormalExtraWidth()
+    {
+        int extraWidth = SettingsManager.Current.RepeatEnabled ? 36 : 0;
+        extraWidth += SettingsManager.Current.ShuffleEnabled ? 36 : 0;
+        extraWidth += SettingsManager.Current.PlayerInfoEnabled ? 90 : 0;
+        extraWidth += 72; // space for -5s and +5s skip buttons
+        return Math.Max(extraWidth, 72);
+    }
+
+    public static double GetCardHeight(bool compact) => compact ? 56 : 102;
+
+    public static double GetFlyoutWidth(bool compact) => compact ? 400 : 310 - 72 + ComputeNormalExtraWidth();
+
+    public void ApplyLayout(bool isPrimaryCard)
+    {
+        bool compact = SettingsManager.Current.CompactLayout;
+        bool repeat = SettingsManager.Current.RepeatEnabled;
+        bool shuffle = SettingsManager.Current.ShuffleEnabled;
+        bool playerInfo = SettingsManager.Current.PlayerInfoEnabled;
+        bool centerText = SettingsManager.Current.CenterTitleArtist;
+        bool alwaysDisplay = SettingsManager.Current.MediaFlyoutAlwaysDisplay;
+
+        Height = GetCardHeight(compact);
+
+        if (compact)
+        {
+            BodyStackPanel.Orientation = Orientation.Horizontal;
+            BodyStackPanel.Width = 300;
+            ControlsStackPanelContainer.Margin = new Thickness(2, 0, 0, 0);
+            ControlsStackPanelContainer.Width = 104;
+            ControlsStackPanelContainer.HorizontalAlignment = HorizontalAlignment.Left;
+            ControlsStackPanel.HorizontalAlignment = HorizontalAlignment.Left;
+            MediaIdButton.Visibility = Visibility.Collapsed;
+            ControlSkipBack.Visibility = Visibility.Collapsed;
+            ControlSkipForward.Visibility = Visibility.Collapsed;
+            ControlRepeat.Visibility = Visibility.Collapsed;
+            ControlShuffle.Visibility = Visibility.Collapsed;
+            ControlClose.Visibility = alwaysDisplay && isPrimaryCard ? Visibility.Visible : Visibility.Collapsed;
+
+            SongImageBorder.Margin = new Thickness(0);
+            SongImageBorder.Width = 36;
+            SongImageBorder.Height = 36;
+            SongImagePlaceholder.FontSize = 20;
+
+            SongInfoStackPanel.Margin = new Thickness(8, 0, 0, 0);
+            SongInfoStackPanel.Width = alwaysDisplay && isPrimaryCard ? 192 : 228;
+            if (alwaysDisplay && isPrimaryCard)
+                ControlsStackPanelContainer.Width += 36;
+        }
+        else
+        {
+            int extraWidth = ComputeNormalExtraWidth();
+            bool centerControlsWithSongInfo = centerText && !playerInfo;
+
+            BodyStackPanel.Orientation = Orientation.Vertical;
+            BodyStackPanel.Width = 194 - 72 + extraWidth;
+            ControlsStackPanelContainer.Margin = new Thickness(8, 8, 0, 0);
+            ControlsStackPanelContainer.Width = double.NaN;
+            ControlsStackPanelContainer.HorizontalAlignment = HorizontalAlignment.Stretch;
+            ControlsStackPanel.HorizontalAlignment = centerControlsWithSongInfo ? HorizontalAlignment.Center : HorizontalAlignment.Left;
+            ControlClose.Visibility = Visibility.Collapsed;
+
+            ControlRepeat.Visibility = repeat ? Visibility.Visible : Visibility.Collapsed;
+            ControlShuffle.Visibility = shuffle ? Visibility.Visible : Visibility.Collapsed;
+            MediaIdButton.Visibility = playerInfo ? Visibility.Visible : Visibility.Collapsed;
+
+            SongImageBorder.Margin = new Thickness(0);
+            SongImageBorder.Width = 82;
+            SongImageBorder.Height = 82;
+            SongImagePlaceholder.FontSize = 40;
+
+            SongInfoStackPanel.Margin = new Thickness(8, 0, 0, 0);
+            SongInfoStackPanel.Width = 182 - 72 + extraWidth;
+        }
+
+        var textAlignment = centerText ? HorizontalAlignment.Center : HorizontalAlignment.Left;
+        SongTitle.HorizontalAlignment = textAlignment;
+        SongArtist.HorizontalAlignment = textAlignment;
+    }
+
+    public void ApplyPlaybackState(MediaSession mediaSession, GlobalSystemMediaTransportControlsSessionPlaybackInfo? playbackInfo)
+    {
+        Session = mediaSession;
+        SessionId = mediaSession.Id;
+
+        if (playbackInfo == null)
+        {
+            ControlPlayPause.IsEnabled = false;
+            ControlPlayPause.Opacity = 0.35;
+            ControlBack.IsEnabled = ControlForward.IsEnabled = false;
+            ControlBack.Opacity = ControlForward.Opacity = 0.35;
+            ControlSkipBack.Visibility = ControlSkipForward.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        SymbolPlayPause.Symbol = playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing
+            ? SymbolRegular.Pause16
+            : SymbolRegular.Play16;
+
+        ControlPlayPause.IsEnabled = playbackInfo.Controls.IsPlayEnabled || playbackInfo.Controls.IsPauseEnabled;
+        ControlPlayPause.Opacity = ControlPlayPause.IsEnabled ? 1 : 0.35;
+
+        ControlBack.IsEnabled = playbackInfo.Controls.IsPreviousEnabled;
+        ControlBack.Opacity = ControlBack.IsEnabled ? 1 : 0.35;
+
+        ControlForward.IsEnabled = playbackInfo.Controls.IsNextEnabled;
+        ControlForward.Opacity = ControlForward.IsEnabled ? 1 : 0.35;
+
+        bool compact = SettingsManager.Current.CompactLayout;
+        bool isSeekEnabled = !compact && playbackInfo.Controls.IsPlaybackPositionEnabled;
+        ControlSkipBack.Visibility = isSeekEnabled ? Visibility.Visible : Visibility.Collapsed;
+        ControlSkipForward.Visibility = isSeekEnabled ? Visibility.Visible : Visibility.Collapsed;
+
+        if (SettingsManager.Current.RepeatEnabled && !compact)
+        {
+            ControlRepeat.Visibility = Visibility.Visible;
+            ControlRepeat.IsEnabled = playbackInfo.Controls.IsRepeatEnabled;
+            ControlRepeat.Opacity = ControlRepeat.IsEnabled ? 1 : 0.35;
+            switch (playbackInfo.AutoRepeatMode)
+            {
+                case MediaPlaybackAutoRepeatMode.List:
+                    SymbolRepeat.Symbol = SymbolRegular.ArrowRepeatAll24;
+                    SymbolRepeat.Opacity = 1;
+                    break;
+                case MediaPlaybackAutoRepeatMode.Track:
+                    SymbolRepeat.Symbol = SymbolRegular.ArrowRepeat124;
+                    SymbolRepeat.Opacity = 1;
+                    break;
+                default:
+                    SymbolRepeat.Symbol = SymbolRegular.ArrowRepeatAllOff24;
+                    SymbolRepeat.Opacity = 0.5;
+                    break;
+            }
+        }
+        else
+        {
+            ControlRepeat.Visibility = Visibility.Collapsed;
+        }
+
+        if (SettingsManager.Current.ShuffleEnabled && !compact)
+        {
+            ControlShuffle.Visibility = Visibility.Visible;
+            ControlShuffle.IsEnabled = playbackInfo.Controls.IsShuffleEnabled;
+            ControlShuffle.Opacity = ControlShuffle.IsEnabled ? 1 : 0.35;
+            bool isShuffling = playbackInfo.IsShuffleActive == true;
+            SymbolShuffle.Symbol = isShuffling ? SymbolRegular.ArrowShuffle24 : SymbolRegular.ArrowShuffleOff24;
+            SymbolShuffle.Opacity = isShuffling ? 1 : 0.5;
+        }
+        else
+        {
+            ControlShuffle.Visibility = Visibility.Collapsed;
+        }
+
+        if (SettingsManager.Current.PlayerInfoEnabled && !compact)
+        {
+            MediaIdButton.Visibility = Visibility.Visible;
+            if (!string.Equals(_lastPlayerId, mediaSession.Id, StringComparison.Ordinal))
+            {
+                _lastPlayerId = mediaSession.Id;
+                (string title, ImageSource? icon) = MediaPlayerData.GetAndCacheMediaPlayerData(mediaSession.Id);
+                MediaId.Text = title;
+                if (icon != null)
+                {
+                    MediaIdIcon.Source = icon;
+                    MediaIdIcon.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    MediaIdIcon.Source = null;
+                    MediaIdIcon.Visibility = Visibility.Collapsed;
+                }
+            }
+        }
+        else
+        {
+            MediaIdButton.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    public void ApplyMediaMetadata(string title, string artist, BitmapImage? thumbnail, int thumbnailHash, SolidColorBrush? accentBrush)
+    {
+        if (!string.Equals(_lastTitle, title, StringComparison.Ordinal) ||
+            !string.Equals(_lastArtist, artist, StringComparison.Ordinal))
+        {
+            _lastTitle = title;
+            _lastArtist = artist;
+            SongTitle.Text = title;
+            SongArtist.Text = artist;
+
+            SongInfoStackPanel.ToolTip = !string.IsNullOrEmpty(title) && !string.IsNullOrEmpty(artist)
+                ? $"{title}\n\n{artist}"
+                : (!string.IsNullOrEmpty(title) ? title : artist);
+        }
+
+        if (_lastThumbnailHash != thumbnailHash)
+        {
+            _lastThumbnailHash = thumbnailHash;
+            SongImage.ImageSource = thumbnail;
+            SongImagePlaceholder.Visibility = thumbnail == null ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        if (SettingsManager.Current.UseAlbumArtAsAccentColor && accentBrush != null)
+        {
+            ControlPlayPause.Background = accentBrush;
+        }
+        else
+        {
+            ControlPlayPause.ClearValue(BackgroundProperty);
+        }
+    }
+
+    public void ShowNoMediaState()
+    {
+        Session = null;
+        SessionId = string.Empty;
+        _lastTitle = "No media playing";
+        _lastArtist = string.Empty;
+        _lastThumbnailHash = 0;
+        _lastPlayerId = null;
+
+        SongTitle.Text = _lastTitle;
+        SongArtist.Text = string.Empty;
+        SongImage.ImageSource = null;
+        SongImagePlaceholder.Visibility = Visibility.Visible;
+        SymbolPlayPause.Symbol = SymbolRegular.Stop16;
+        ControlPlayPause.IsEnabled = false;
+        ControlPlayPause.Opacity = 0.35;
+        ControlBack.IsEnabled = ControlForward.IsEnabled = false;
+        ControlBack.Opacity = ControlForward.Opacity = 0.35;
+        ControlSkipBack.Visibility = ControlSkipForward.Visibility = Visibility.Collapsed;
+        ControlRepeat.Visibility = ControlShuffle.Visibility = Visibility.Collapsed;
+        MediaIdButton.Visibility = Visibility.Collapsed;
+        SongInfoStackPanel.ToolTip = string.Empty;
+    }
+
+    private void MediaIdButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!SettingsManager.Current.PlayerInfoEnabled || SettingsManager.Current.CompactLayout) return;
+        e.Handled = true;
+
+        if (e.OriginalSource is ToggleButton)
+        {
+            SessionSwitcherRequested?.Invoke(this, MediaIdButton);
+            return;
+        }
+
+        if (Session == null) return;
+        string id = Session.Id;
+        string? title = _lastTitle;
+        _ = Task.Run(() => MediaPlayerData.TryActivateMediaPlayer(id, title));
+    }
+
+    private async void Back_Click(object sender, RoutedEventArgs e)
+    {
+        if (Session?.ControlSession is not { } controlSession) return;
+        try { await controlSession.TrySkipPreviousAsync(); }
+        catch (Exception ex) { Logger.Warn(ex, "Failed to skip previous"); }
+    }
+
+    private async void PlayPause_Click(object sender, RoutedEventArgs e)
+    {
+        if (Session?.ControlSession is not { } controlSession) return;
+        try { await controlSession.TryTogglePlayPauseAsync(); }
+        catch (Exception ex) { Logger.Warn(ex, "Failed to toggle play/pause"); }
+    }
+
+    private async void Forward_Click(object sender, RoutedEventArgs e)
+    {
+        if (Session?.ControlSession is not { } controlSession) return;
+        try { await controlSession.TrySkipNextAsync(); }
+        catch (Exception ex) { Logger.Warn(ex, "Failed to skip next"); }
+    }
+
+    private void SkipBack_Click(object sender, RoutedEventArgs e) => _ = SeekByAsync(-SkipOffset);
+
+    private void SkipForward_Click(object sender, RoutedEventArgs e) => _ = SeekByAsync(SkipOffset);
+
+    private async Task SeekByAsync(TimeSpan offset)
+    {
+        if (Session?.ControlSession is not { } controlSession) return;
+        try
+        {
+            var timeline = controlSession.GetTimelineProperties();
+            if (timeline == null) return;
+
+            TimeSpan currentPos = timeline.Position;
+            var playbackStatus = controlSession.GetPlaybackInfo()?.PlaybackStatus;
+            if (playbackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing &&
+                timeline.LastUpdatedTime != DateTimeOffset.MinValue)
+            {
+                currentPos += DateTimeOffset.UtcNow - timeline.LastUpdatedTime;
+            }
+
+            long minTicks = timeline.StartTime.Ticks;
+            long maxTicks = timeline.EndTime.Ticks > minTicks ? timeline.EndTime.Ticks : long.MaxValue;
+            long targetTicks = Math.Clamp(currentPos.Ticks + offset.Ticks, minTicks, maxTicks);
+
+            await controlSession.TryChangePlaybackPositionAsync(targetTicks);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex, "Failed to seek playback position");
+        }
+    }
+
+    private async void Repeat_Click(object sender, RoutedEventArgs e)
+    {
+        if (Session?.ControlSession is not { } controlSession) return;
+        try
+        {
+            var info = controlSession.GetPlaybackInfo();
+            if (info == null) return;
+
+            switch (info.AutoRepeatMode)
+            {
+                case MediaPlaybackAutoRepeatMode.None:
+                    SymbolRepeat.Symbol = SymbolRegular.ArrowRepeatAll24;
+                    await controlSession.TryChangeAutoRepeatModeAsync(MediaPlaybackAutoRepeatMode.List);
+                    break;
+                case MediaPlaybackAutoRepeatMode.List:
+                    SymbolRepeat.Symbol = SymbolRegular.ArrowRepeat124;
+                    await controlSession.TryChangeAutoRepeatModeAsync(MediaPlaybackAutoRepeatMode.Track);
+                    break;
+                case MediaPlaybackAutoRepeatMode.Track:
+                    SymbolRepeat.Symbol = SymbolRegular.ArrowRepeatAllOff24;
+                    await controlSession.TryChangeAutoRepeatModeAsync(MediaPlaybackAutoRepeatMode.None);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex, "Failed to change repeat mode");
+        }
+    }
+
+    private async void Shuffle_Click(object sender, RoutedEventArgs e)
+    {
+        if (Session?.ControlSession is not { } controlSession) return;
+        try
+        {
+            var info = controlSession.GetPlaybackInfo();
+            if (info == null) return;
+
+            bool nextShuffle = info.IsShuffleActive != true;
+            SymbolShuffle.Symbol = nextShuffle ? SymbolRegular.ArrowShuffle24 : SymbolRegular.ArrowShuffleOff24;
+            await controlSession.TryChangeShuffleActiveAsync(nextShuffle);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex, "Failed to toggle shuffle mode");
+        }
+    }
+
+    private void Close_Click(object sender, RoutedEventArgs e) => CloseFlyoutRequested?.Invoke(this, EventArgs.Empty);
+}

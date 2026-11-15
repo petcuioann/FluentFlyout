@@ -9,6 +9,7 @@ using FluentFlyout.Windows;
 using FluentFlyoutWPF.Classes;
 using FluentFlyoutWPF.Classes.Services;
 using FluentFlyoutWPF.Classes.Utils;
+using FluentFlyoutWPF.Controls;
 using FluentFlyoutWPF.ViewModels;
 using FluentFlyoutWPF.Windows;
 using MicaWPF.Controls;
@@ -54,9 +55,7 @@ public partial class MainWindow : MicaWindow
     private bool _shuffleEnabled = SettingsManager.Current.ShuffleEnabled;
     private bool _playerInfoEnabled = SettingsManager.Current.PlayerInfoEnabled;
     private bool _centerTitleArtist = SettingsManager.Current.CenterTitleArtist;
-    private bool _seekBarEnabled = SettingsManager.Current.SeekbarEnabled;
     private bool _alwaysDisplay = SettingsManager.Current.MediaFlyoutAlwaysDisplay;
-    private bool _mediaSessionSupportsSeekbar = false; // default off to handle initialization
     private bool _acrylicEnabled = false; // default off to handle initialization
     private int _themeOption = SettingsManager.Current.AppTheme;
 
@@ -65,14 +64,18 @@ public partial class MainWindow : MicaWindow
     private NextUpWindow? nextUpWindow = null; // to prevent multiple instances of NextUpWindow
     private string currentTitle = ""; // to prevent NextUpWindow from showing the same song
 
-    private readonly int _seekbarUpdateInterval = 300;
-    private readonly Timer _positionTimer;
-    private bool _isActive;
-    private bool _isDragging;
     private bool _isHiding = true;
 
     private LockWindow? lockWindow;
-    private DateTime _lastSelfUpdateTimestamp = DateTime.MinValue;
+
+    private readonly Lock _sessionHistoryLock = new();
+    private readonly List<string> _sessionHistory = [];
+    private readonly Dictionary<string, MediaSessionControl> _sessionControls = [];
+    private MediaSessionControl? _noMediaControl;
+    private CancellationTokenSource? _flyoutMetadataCts;
+    private string? _lastBlurSessionId;
+    private int _lastBlurThumbnailHash = -1;
+    private int _lastBackgroundBlurStyle = -1;
 
     internal TaskbarWindow? taskbarWindow;
 
@@ -159,7 +162,7 @@ public partial class MainWindow : MicaWindow
             RegistryKey? key = Registry.CurrentUser.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true);
             string? executablePath = Environment.ProcessPath;
             if (key != null && executablePath != null)
-                key.SetValue("FluentFlyout", executablePath);
+                key.SetValue("FluentFlyout", $"\"{executablePath}\"");
         }
 
         // display tray icon if enabled
@@ -181,7 +184,6 @@ public partial class MainWindow : MicaWindow
 
         mediaManager.OnAnyMediaPropertyChanged += MediaManager_OnAnyMediaPropertyChanged;
         mediaManager.OnAnyPlaybackStateChanged += CurrentSession_OnPlaybackStateChanged;
-        mediaManager.OnAnyTimelinePropertyChanged += MediaManager_OnAnyTimelinePropertyChanged;
         mediaManager.OnAnySessionClosed += MediaManager_OnAnySessionClosed;
 
         InitializeHeadsetControls();
@@ -189,12 +191,6 @@ public partial class MainWindow : MicaWindow
         WM_TASKBARCREATED = RegisterWindowMessage("TaskbarCreated");
         WM_SHELLHOOK = RegisterWindowMessage("SHELLHOOK");
         RegisterShellHookWindow(new WindowInteropHelper(this).Handle);
-
-        _positionTimer = new Timer(SeekbarUpdateUi, null, Timeout.Infinite, Timeout.Infinite);
-        if (_seekBarEnabled && GetActiveMediaSession() is { } session)
-        {
-            UpdateSeekbarCurrentDuration(session.ControlSession.GetTimelineProperties().Position);
-        }
 
         string previousVersion = SettingsManager.Current.LastKnownVersion;
         _ = CheckForExperimentsOnStartupAsync(previousVersion);
@@ -310,6 +306,53 @@ public partial class MainWindow : MicaWindow
         return appName.Equals(entry, StringComparison.OrdinalIgnoreCase) || appId.Contains(entry, StringComparison.OrdinalIgnoreCase);
     }
 
+    private void PromoteSessionHistory(string sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return;
+        lock (_sessionHistoryLock)
+        {
+            _sessionHistory.Remove(sessionId);
+            _sessionHistory.Insert(0, sessionId);
+        }
+    }
+
+    private void RemoveSessionHistory(string sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return;
+        lock (_sessionHistoryLock)
+        {
+            _sessionHistory.Remove(sessionId);
+        }
+    }
+
+    public void CycleActiveMediaSession(int direction)
+    {
+        var validSessions = mediaManager.CurrentMediaSessions.Values.Where(IsSessionAllowed).ToList();
+        var playingSessions = validSessions
+            .Where(s => s.ControlSession?.GetPlaybackInfo()?.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
+            .ToList();
+
+        var cycleList = playingSessions.Count >= 2
+            ? playingSessions
+            : (playingSessions.Count == 0 && validSessions.Count >= 2 ? validSessions : null);
+
+        if (cycleList == null) return;
+
+        string? currentActiveId = GetActiveMediaSession()?.Id;
+        int currentIndex = cycleList.FindIndex(s => s.Id == currentActiveId);
+        if (currentIndex < 0) currentIndex = 0;
+
+        int newIndex = ((currentIndex + direction) % cycleList.Count + cycleList.Count) % cycleList.Count;
+        var nextSession = cycleList[newIndex];
+
+        SettingsManager.Current.PinnedSessionId = string.Empty;
+        PromoteSessionHistory(nextSession.Id);
+        UpdateTaskbar();
+
+        if (IsVisible)
+            UpdateUI(nextSession);
+    }
+
     public MediaSession? GetActiveMediaSession()
     {
         var validSessions = mediaManager.CurrentMediaSessions.Values.Where(IsSessionAllowed).ToList();
@@ -324,6 +367,19 @@ public partial class MainWindow : MicaWindow
                 return pinned;
 
             SettingsManager.Current.PinnedSessionId = string.Empty;
+        }
+
+        List<string> historySnapshot;
+        lock (_sessionHistoryLock)
+        {
+            historySnapshot = [.. _sessionHistory];
+        }
+
+        foreach (var id in historySnapshot)
+        {
+            var manuallySelected = validSessions.FirstOrDefault(s => s.Id == id);
+            if (manuallySelected != null)
+                return manuallySelected;
         }
 
         var focused = mediaManager.GetFocusedSession();
@@ -377,19 +433,7 @@ public partial class MainWindow : MicaWindow
 
         if (IsVisible)
         {
-            var activeSession = GetActiveMediaSession();
-
-            // UpdateUI handles a null value internally so we haven't checked for null here.
-            UpdateUI(activeSession!);
-
-            if (activeSession != null)
-            {
-                HandlePlayBackState(activeSession.ControlSession.GetPlaybackInfo()?.PlaybackStatus);
-            }
-            else
-            {
-                HandlePlayBackState(GlobalSystemMediaTransportControlsSessionPlaybackStatus.Closed);
-            }
+            UpdateUI(GetActiveMediaSession());
         }
     }
 
@@ -770,32 +814,39 @@ public partial class MainWindow : MicaWindow
 
     private void CurrentSession_OnPlaybackStateChanged(MediaSession mediaSession, GlobalSystemMediaTransportControlsSessionPlaybackInfo? playbackInfo = null)
     {
+        var newStatus = playbackInfo?.PlaybackStatus ?? mediaSession.ControlSession?.GetPlaybackInfo()?.PlaybackStatus;
 #if DEBUG
-        Logger.Debug("Playback state changed: " + mediaSession.Id + " " + mediaSession.ControlSession.GetPlaybackInfo().PlaybackStatus);
-#endif     
+        Logger.Debug("Playback state changed: " + mediaSession.Id + " " + newStatus);
+#endif
         pauseOtherMediaSessionsIfNeeded(mediaSession);
 
-        var focusedSession = GetActiveMediaSession();
-        if (focusedSession == null)
+        if (newStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
         {
-            taskbarWindow?.UpdateUi("-", "-", null, GlobalSystemMediaTransportControlsSessionPlaybackStatus.Closed);
-            return;
+            PromoteSessionHistory(mediaSession.Id);
+        }
+        else if (newStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused)
+        {
+            PromoteSessionHistory(mediaSession.Id);
+
+            if (GetActiveMediaSession()?.Id == mediaSession.Id)
+            {
+                var otherPlaying = mediaManager.CurrentMediaSessions.Values
+                    .Where(IsSessionAllowed)
+                    .FirstOrDefault(s => s.Id != mediaSession.Id &&
+                        s.ControlSession?.GetPlaybackInfo()?.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing);
+
+                if (otherPlaying != null)
+                {
+                    PromoteSessionHistory(otherPlaying.Id);
+                }
+            }
         }
 
-        var tbSongInfo = TryGetMediaProperties(focusedSession.ControlSession);
-        if (tbSongInfo != null)
-        {
-            var tbThumbnail = BitmapHelper.GetThumbnail(tbSongInfo.Thumbnail);
-            BitmapHelper.GetDominantColors(1);
-            var tbPlayback = focusedSession.ControlSession.GetPlaybackInfo();
-
-            taskbarWindow?.UpdateUi(tbSongInfo.Title, tbSongInfo.Artist, tbThumbnail, tbPlayback?.PlaybackStatus, tbPlayback?.Controls);
-        }
+        UpdateTaskbar();
 
         if (IsVisible)
         {
-            UpdateUI(focusedSession);
-            HandlePlayBackState(playbackInfo?.PlaybackStatus);
+            UpdateUI(GetActiveMediaSession());
         }
     }
 
@@ -824,91 +875,74 @@ public partial class MainWindow : MicaWindow
 
         var playbackInfo = currentActiveSession.ControlSession.GetPlaybackInfo();
 
-        string check = songInfo.Title + songInfo.Artist + playbackInfo.PlaybackStatus;
+        string check = currentActiveSession.Id + songInfo.Title + songInfo.Artist + playbackInfo.PlaybackStatus;
         int checkThumbnail = BitmapHelper.GetStableThumbnailHash(songInfo.Thumbnail);
         bool onlyThumbnailChanged = false;
+        bool isActiveDuplicate = false;
         if (previousMediaProperty == check)
         {
             onlyThumbnailChanged = true;
             if (previousMediaPropertyThumbnail == checkThumbnail)
-                return; // prevent multiple calls for the same song info
+                isActiveDuplicate = true;
         }
 
-        previousMediaProperty = check;
-        previousMediaPropertyThumbnail = checkThumbnail;
-
-        var thumbnail = BitmapHelper.GetThumbnail(songInfo.Thumbnail);
-        BitmapHelper.GetDominantColors(1);
-
-        taskbarWindow?.UpdateUi(songInfo.Title, songInfo.Artist, thumbnail, playbackInfo.PlaybackStatus, playbackInfo.Controls);
-
-        pauseOtherMediaSessionsIfNeeded(mediaSession);
-
-        if (SettingsManager.Current.NextUpEnabled && !FullscreenDetector.IsFullscreenApplicationRunning()) // show NextUpWindow if enabled in settings
+        if (!isActiveDuplicate)
         {
-            void createNewNextUpWindow()
+            previousMediaProperty = check;
+            previousMediaPropertyThumbnail = checkThumbnail;
+
+            var thumbnail = BitmapHelper.GetThumbnail(songInfo.Thumbnail);
+            BitmapHelper.GetDominantColors(1);
+
+            taskbarWindow?.UpdateUi(songInfo.Title, songInfo.Artist, thumbnail, playbackInfo.PlaybackStatus, playbackInfo.Controls);
+
+            pauseOtherMediaSessionsIfNeeded(mediaSession);
+
+            if (SettingsManager.Current.NextUpEnabled && !FullscreenDetector.IsFullscreenApplicationRunning()) // show NextUpWindow if enabled in settings
             {
-                Dispatcher.Invoke(() =>
+                void createNewNextUpWindow()
                 {
-                    if (nextUpWindow == null && playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing) // double-check within the Dispatcher to prevent race conditions
+                    Dispatcher.Invoke(() =>
                     {
-                        nextUpWindow = new NextUpWindow(songInfo.Title, songInfo.Artist, thumbnail);
-                        currentTitle = songInfo.Title;
-                        nextUpWindow.Closed += (s, e) => nextUpWindow = null; // set nextUpWindow to null when closed
-                    }
-                });
-            }
+                        if (nextUpWindow == null && playbackInfo.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing) // double-check within the Dispatcher to prevent race conditions
+                        {
+                            nextUpWindow = new NextUpWindow(songInfo.Title, songInfo.Artist, thumbnail);
+                            currentTitle = songInfo.Title;
+                            nextUpWindow.Closed += (s, e) => nextUpWindow = null; // set nextUpWindow to null when closed
+                        }
+                    });
+                }
 
-            if (nextUpWindow == null && IsVisible == false && songInfo.Thumbnail != null && currentTitle != songInfo.Title)
-            {
-                createNewNextUpWindow();
-            }
-            else if (nextUpWindow != null && !onlyThumbnailChanged)
-            {
-                Dispatcher.Invoke(() =>
+                if (nextUpWindow == null && IsVisible == false && songInfo.Thumbnail != null && currentTitle != songInfo.Title)
                 {
-                    if (nextUpWindow != null)
+                    createNewNextUpWindow();
+                }
+                else if (nextUpWindow != null && !onlyThumbnailChanged)
+                {
+                    Dispatcher.Invoke(() =>
                     {
-                        WindowHelper.SetVisibility(nextUpWindow, false); // prevents rare flickering during rapid closing
-                        nextUpWindow.Close(); // must be cleared by the Closed event
-                    }
-                });
-                createNewNextUpWindow();
-            }
-            else if (nextUpWindow != null && songInfo.Thumbnail != null)
-            {
-                Dispatcher.Invoke(() =>
+                        if (nextUpWindow != null)
+                        {
+                            WindowHelper.SetVisibility(nextUpWindow, false); // prevents rare flickering during rapid closing
+                            nextUpWindow.Close(); // must be cleared by the Closed event
+                        }
+                    });
+                    createNewNextUpWindow();
+                }
+                else if (nextUpWindow != null && songInfo.Thumbnail != null)
                 {
-                    nextUpWindow?.UpdateThumbnail(thumbnail);
-                });
+                    Dispatcher.Invoke(() =>
+                    {
+                        nextUpWindow?.UpdateThumbnail(thumbnail);
+                    });
+                }
             }
         }
 
-        if (IsVisible)
+        // Refresh multi-session cards even if a non-active background session changed while the flyout is open
+        if (IsVisible && (!isActiveDuplicate || mediaSession.Id != currentActiveSession.Id))
         {
-            var focusedSession = GetActiveMediaSession();
-            if (focusedSession != null)
-            {
-                HandlePlayBackState(focusedSession.ControlSession.GetPlaybackInfo()?.PlaybackStatus);
-                UpdateUI(focusedSession);
-            }
-        }
-    }
-
-    private void MediaManager_OnAnyTimelinePropertyChanged(MediaSession mediaSession, GlobalSystemMediaTransportControlsSessionTimelineProperties timelineProperties)
-    {
-        if (GetActiveMediaSession() is not { } session || session.Id != mediaSession.Id) return;
-
-        if (_seekBarEnabled)
-        {
-            Dispatcher.Invoke(() =>
-            {
-                if (Visibility != Visibility.Visible || _isHiding || _isDragging) return;
-
-                _lastSelfUpdateTimestamp = DateTime.Now;
-                UpdateSeekbarCurrentDuration(session.ControlSession.GetTimelineProperties().Position);
-                HandlePlayBackState(session.ControlSession.GetPlaybackInfo().PlaybackStatus);
-            });
+            UpdateUI(currentActiveSession);
         }
     }
 
@@ -917,12 +951,19 @@ public partial class MainWindow : MicaWindow
 #if DEBUG
         Logger.Debug("Session closed: " + (mediaSession.Id).ToString());
 #endif
+        RemoveSessionHistory(mediaSession.Id);
+
         if (!string.IsNullOrEmpty(SettingsManager.Current.PinnedSessionId)
             && SettingsManager.Current.PinnedSessionId == mediaSession.Id)
         {
             SettingsManager.Current.PinnedSessionId = string.Empty;
         }
         UpdateTaskbar();
+
+        if (IsVisible)
+        {
+            UpdateUI(GetActiveMediaSession());
+        }
     }
 
     private static IntPtr SetHook(LowLevelKeyboardProc proc) // set the keyboard hook
@@ -1051,15 +1092,11 @@ public partial class MainWindow : MicaWindow
             if (_isHiding)
             {
                 Hide();
-                if (_seekBarEnabled)
-                    HandlePlayBackState(GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused);
             }
             return;
         }
 
         UpdateUI(activeSession);
-        if (_seekBarEnabled)
-            HandlePlayBackState(activeSession.ControlSession.GetPlaybackInfo().PlaybackStatus);
 
         if (nextUpWindow != null) // close NextUpWindow if it's open
         {
@@ -1112,8 +1149,6 @@ public partial class MainWindow : MicaWindow
                         await Task.Delay(getDuration());
                         if (_isHiding == false) return;
                         Hide();
-                        if (_seekBarEnabled)
-                            HandlePlayBackState(GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused);
                         break;
                     }
                 }
@@ -1127,266 +1162,255 @@ public partial class MainWindow : MicaWindow
 
     private void UpdateMediaFlyoutCloseButtonVisibility()
     {
-        MediaFlyoutCloseButton.Visibility = SettingsManager.Current.MediaFlyoutAlwaysDisplay && !SettingsManager.Current.CompactLayout ? Visibility.Visible : Visibility.Collapsed;
-        ControlClose.Visibility = SettingsManager.Current.MediaFlyoutAlwaysDisplay && SettingsManager.Current.CompactLayout ? Visibility.Visible : Visibility.Collapsed;
+        MediaFlyoutCloseButton.Visibility = SettingsManager.Current.MediaFlyoutAlwaysDisplay && !SettingsManager.Current.CompactLayout
+            ? Visibility.Visible
+            : Visibility.Collapsed;
     }
 
-    private void UpdateUI(MediaSession mediaSession)
+    private void SessionControl_SessionSwitcherRequested(object? sender, UIElement placementTarget)
+        => ShowSessionSwitcherMenu(placementTarget);
+
+    private void SessionControl_CloseFlyoutRequested(object? sender, EventArgs e)
+        => ShowMediaFlyout(toggleMode: true, withVolume: true);
+
+    private void AttachSessionControl(MediaSessionControl control)
+    {
+        control.SessionSwitcherRequested += SessionControl_SessionSwitcherRequested;
+        control.CloseFlyoutRequested += SessionControl_CloseFlyoutRequested;
+    }
+
+    private void DetachSessionControl(MediaSessionControl control)
+    {
+        control.SessionSwitcherRequested -= SessionControl_SessionSwitcherRequested;
+        control.CloseFlyoutRequested -= SessionControl_CloseFlyoutRequested;
+    }
+
+    private void UpdateFlyoutBackgroundBlur(string? sessionId, System.Windows.Media.Imaging.BitmapImage? image, int thumbnailHash)
+    {
+        int blurStyle = SettingsManager.Current.MediaFlyoutBackgroundBlur;
+        BackgroundImageStyle1.Visibility = blurStyle == 1 ? Visibility.Visible : Visibility.Collapsed;
+        BackgroundImageStyle2.Visibility = blurStyle == 2 ? Visibility.Visible : Visibility.Collapsed;
+        BackgroundImageStyle3.Visibility = blurStyle == 3 ? Visibility.Visible : Visibility.Collapsed;
+
+        if (blurStyle == 0 || image == null)
+        {
+            BackgroundImageStyle1.Source = null;
+            BackgroundImageStyle2.Source = null;
+            BackgroundImageStyle3.Source = null;
+            _lastBlurSessionId = sessionId;
+            _lastBlurThumbnailHash = 0;
+            _lastBackgroundBlurStyle = blurStyle;
+            return;
+        }
+
+        if (_lastBlurSessionId == sessionId &&
+            _lastBlurThumbnailHash == thumbnailHash &&
+            _lastBackgroundBlurStyle == blurStyle)
+            return;
+
+        _lastBlurSessionId = sessionId;
+        _lastBlurThumbnailHash = thumbnailHash;
+        _lastBackgroundBlurStyle = blurStyle;
+
+        var croppedImage = BitmapHelper.CropToSquare(image);
+        switch (blurStyle)
+        {
+            case 1:
+                BackgroundImageStyle1.Source = croppedImage;
+                break;
+            case 2:
+                BackgroundImageStyle2.Source = croppedImage;
+                break;
+            case 3:
+                BackgroundImageStyle3.Source = croppedImage;
+                break;
+        }
+    }
+
+    private void UpdateUI(MediaSession? activeSession)
     {
         if (_layout != SettingsManager.Current.CompactLayout ||
             _shuffleEnabled != SettingsManager.Current.ShuffleEnabled ||
             _repeatEnabled != SettingsManager.Current.RepeatEnabled ||
             _playerInfoEnabled != SettingsManager.Current.PlayerInfoEnabled ||
             _centerTitleArtist != SettingsManager.Current.CenterTitleArtist ||
-            _seekBarEnabled != SettingsManager.Current.SeekbarEnabled ||
             _alwaysDisplay != SettingsManager.Current.MediaFlyoutAlwaysDisplay)
             UpdateUILayout();
 
-        // sometimes mediaSession.ControlSession can be null
-        if (mediaSession.ControlSession == null)
-            return;
-
-        var controlSession = mediaSession.ControlSession;
+        List<MediaSession> validSessions = [];
+        List<(MediaSession Session, MediaSessionControl Control)> activePairs = [];
 
         Dispatcher.Invoke(() =>
         {
             UpdateMediaFlyoutCloseButtonVisibility();
-            this.EnableBackdrop(); // ensures the backdrop is enabled as sometimes it gets disabled
+            this.EnableBackdrop();
 
-            if (mediaSession == null)
+            if (SettingsManager.Current.MediaFlyoutAcrylicWindowEnabled != _acrylicEnabled
+                || SettingsManager.Current.AppTheme != _themeOption)
             {
-                SongTitle.Text = "No media playing";
-                SongArtist.Text = string.Empty;
-                SongImage.ImageSource = null;
-                SymbolPlayPause.Symbol = Wpf.Ui.Controls.SymbolRegular.Stop16;
-                ControlPlayPause.IsEnabled = false;
-                ControlPlayPause.Opacity = 0.35;
-                ControlBack.IsEnabled = ControlForward.IsEnabled = false;
-                ControlBack.Opacity = ControlForward.Opacity = 0.35;
-                SongInfoStackPanel.ToolTip = string.Empty;
-                return;
+                _acrylicEnabled = SettingsManager.Current.MediaFlyoutAcrylicWindowEnabled;
+                _themeOption = SettingsManager.Current.AppTheme;
+                ToggleBlur();
             }
 
-            var mediaProperties = controlSession.GetPlaybackInfo();
-            if (mediaProperties != null)
+            validSessions = mediaManager.CurrentMediaSessions.Values.Where(IsSessionAllowed).ToList();
+
+            if (validSessions.Count == 0)
             {
-                if (mediaProperties.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
+                foreach (var existing in _sessionControls.Values)
                 {
-                    SymbolPlayPause.Symbol = Wpf.Ui.Controls.SymbolRegular.Pause16;
+                    DetachSessionControl(existing);
                 }
-                else
+                _sessionControls.Clear();
+                MediaSessionsStackPanel.Children.Clear();
+
+                _noMediaControl ??= new MediaSessionControl();
+                _noMediaControl.ApplyLayout(isPrimaryCard: true);
+                _noMediaControl.ShowNoMediaState();
+                MediaSessionsStackPanel.Children.Add(_noMediaControl);
+
+                UpdateFlyoutBackgroundBlur(null, null, 0);
+            }
+            else
+            {
+                _noMediaControl = null;
+                var validIds = validSessions.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
+
+                // Remove closed sessions cleanly
+                foreach (var staleId in _sessionControls.Keys.Where(id => !validIds.Contains(id)).ToList())
                 {
-                    SymbolPlayPause.Symbol = Wpf.Ui.Controls.SymbolRegular.Play16;
-                }
-
-                ControlPlayPause.IsEnabled = mediaProperties.Controls.IsPlayEnabled || mediaProperties.Controls.IsPauseEnabled;
-
-                ControlPlayPause.Opacity = ControlPlayPause.IsEnabled ? 1 : 0.35;
-
-                ControlBack.IsEnabled = ControlForward.IsEnabled = mediaProperties.Controls.IsNextEnabled;
-                ControlBack.Opacity = ControlForward.Opacity = mediaProperties.Controls.IsNextEnabled ? 1 : 0.35;
-
-                if (SettingsManager.Current.RepeatEnabled && !SettingsManager.Current.CompactLayout)
-                {
-                    ControlRepeat.Visibility = Visibility.Visible;
-                    ControlRepeat.IsEnabled = mediaProperties.Controls.IsRepeatEnabled;
-                    ControlRepeat.Opacity = mediaProperties.Controls.IsRepeatEnabled ? 1 : 0.35;
-                    if (mediaProperties.AutoRepeatMode == global::Windows.Media.MediaPlaybackAutoRepeatMode.List)
-                    {
-                        SymbolRepeat.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowRepeatAll24;
-                        SymbolRepeat.Opacity = 1;
-                    }
-                    else if (mediaProperties.AutoRepeatMode == global::Windows.Media.MediaPlaybackAutoRepeatMode.Track)
-                    {
-                        SymbolRepeat.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowRepeat124;
-                        SymbolRepeat.Opacity = 1;
-                    }
-                    else if (mediaProperties.AutoRepeatMode == global::Windows.Media.MediaPlaybackAutoRepeatMode.None)
-                    {
-                        SymbolRepeat.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowRepeatAllOff24;
-                        SymbolRepeat.Opacity = 0.5;
-                    }
-                }
-                else ControlRepeat.Visibility = Visibility.Collapsed;
-
-
-                if (SettingsManager.Current.ShuffleEnabled && !SettingsManager.Current.CompactLayout)
-                {
-                    ControlShuffle.Visibility = Visibility.Visible;
-                    ControlShuffle.IsEnabled = mediaProperties.Controls.IsShuffleEnabled;
-                    ControlShuffle.Opacity = mediaProperties.Controls.IsShuffleEnabled ? 1 : 0.35;
-                    if (mediaProperties.IsShuffleActive == true)
-                    {
-                        SymbolShuffle.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowShuffle24;
-                        SymbolShuffle.Opacity = 1;
-                    }
-                    else
-                    {
-                        SymbolShuffle.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowShuffleOff24;
-                        SymbolShuffle.Opacity = 0.5;
-                    }
-                }
-                else ControlShuffle.Visibility = Visibility.Collapsed;
-
-
-                if (SettingsManager.Current.PlayerInfoEnabled && !SettingsManager.Current.CompactLayout)
-                {
-                    MediaIdButton.Visibility = Visibility.Visible;
-                    (string title, ImageSource? Icon) = MediaPlayerData.GetAndCacheMediaPlayerData(mediaSession.Id);
-                    MediaId.Text = title;
-                    if (Icon != null)
-                    {
-                        MediaIdIcon.Source = Icon;
-                        MediaIdIcon.Visibility = Visibility.Visible;
-                    }
-                    else
-                    {
-                        MediaIdIcon.Visibility = Visibility.Collapsed;
-                    }
-                }
-                else MediaIdButton.Visibility = Visibility.Collapsed;
-
-                // background blurred image visibility setting
-                BackgroundImageStyle1.Visibility = SettingsManager.Current.MediaFlyoutBackgroundBlur == 1 ? Visibility.Visible : Visibility.Collapsed;
-                BackgroundImageStyle2.Visibility = SettingsManager.Current.MediaFlyoutBackgroundBlur == 2 ? Visibility.Visible : Visibility.Collapsed;
-                BackgroundImageStyle3.Visibility = SettingsManager.Current.MediaFlyoutBackgroundBlur == 3 ? Visibility.Visible : Visibility.Collapsed;
-
-                // color play/pause button
-                if (BitmapHelper.SavedDominantColors.Count > 0)
-                {
-                    SolidColorBrush brush = BitmapHelper.SavedDominantColors.First();
-                    ControlPlayPause.Background = brush;
+                    var staleControl = _sessionControls[staleId];
+                    DetachSessionControl(staleControl);
+                    _sessionControls.Remove(staleId);
+                    MediaSessionsStackPanel.Children.Remove(staleControl);
                 }
 
-                // acrylic effect setting
-                if (SettingsManager.Current.MediaFlyoutAcrylicWindowEnabled != _acrylicEnabled
-                || SettingsManager.Current.AppTheme != _themeOption) // if theme changes, reapply acrylic for updated background color
+                // Clear placeholder if transitioning from 0 -> N sessions
+                if (MediaSessionsStackPanel.Children.Count == 1 &&
+                    MediaSessionsStackPanel.Children[0] is MediaSessionControl { Session: null } placeholder)
                 {
-                    _acrylicEnabled = SettingsManager.Current.MediaFlyoutAcrylicWindowEnabled;
-                    ToggleBlur(); // called enabled but it actually toggles based on the setting
+                    MediaSessionsStackPanel.Children.Remove(placeholder);
+                }
+
+                // Reuse or create MediaSessionControl instances without visual tree churn
+                for (int i = 0; i < validSessions.Count; i++)
+                {
+                    var session = validSessions[i];
+                    if (!_sessionControls.TryGetValue(session.Id, out var control))
+                    {
+                        control = new MediaSessionControl();
+                        AttachSessionControl(control);
+                        _sessionControls[session.Id] = control;
+                    }
+
+                    if (MediaSessionsStackPanel.Children.Count <= i || !ReferenceEquals(MediaSessionsStackPanel.Children[i], control))
+                    {
+                        MediaSessionsStackPanel.Children.Remove(control);
+                        MediaSessionsStackPanel.Children.Insert(Math.Min(i, MediaSessionsStackPanel.Children.Count), control);
+                    }
+
+                    control.ApplyLayout(isPrimaryCard: i == 0);
+                    control.ApplyPlaybackState(session, session.ControlSession?.GetPlaybackInfo());
+                    activePairs.Add((session, control));
                 }
             }
 
-            var songInfo = TryGetMediaProperties(controlSession);
-            if (songInfo == null)
-                return;
-
-            if (songInfo != null)
-            {
-                SongTitle.Text = songInfo.Title;
-                SongArtist.Text = songInfo.Artist;
-                var image = BitmapHelper.GetThumbnail(songInfo.Thumbnail);
-                SongImage.ImageSource = image;
-
-                // set tooltip
-                SongInfoStackPanel.ToolTip = string.Empty;
-                SongInfoStackPanel.ToolTip += !String.IsNullOrEmpty(songInfo.Title) ? songInfo.Title : string.Empty;
-                SongInfoStackPanel.ToolTip += !String.IsNullOrEmpty(songInfo.Artist) ? "\n\n" + songInfo.Artist : string.Empty;
-
-                // background blurred image
-                if (SettingsManager.Current.MediaFlyoutBackgroundBlur != 0)
-                {
-                    // make image 1:1 aspect ratio so gradient masks work for non-square images
-                    var croppedImage = BitmapHelper.CropToSquare(image);
-
-                    switch (SettingsManager.Current.MediaFlyoutBackgroundBlur)
-                    {
-                        case 1:
-                            BackgroundImageStyle1.Source = croppedImage;
-                            break;
-                        case 2:
-                            BackgroundImageStyle2.Source = croppedImage;
-                            break;
-                        case 3:
-                            BackgroundImageStyle3.Source = croppedImage;
-                            break;
-                    }
-                }
-
-                SongImagePlaceholder.Visibility = SongImage.ImageSource == null ? Visibility.Visible : Visibility.Collapsed;
-
-                if (_seekBarEnabled)
-                {
-                    var timeline = controlSession.GetTimelineProperties();
-
-                    // State tracking
-                    bool mediaSessionSupportsSeekbar = timeline.MaxSeekTime.TotalSeconds >= 1.0; // Heuristics
-
-                    if (_mediaSessionSupportsSeekbar != mediaSessionSupportsSeekbar)
-                    {
-                        _mediaSessionSupportsSeekbar = mediaSessionSupportsSeekbar;
-                        UpdateUILayout();
-                        // Force refly
-                        _isHiding = true;
-                        ShowMediaFlyout();
-                    }
-
-                    if (mediaSessionSupportsSeekbar)
-                    {
-                        Seekbar.Maximum = timeline.MaxSeekTime.TotalSeconds;
-                        SeekbarMaxDuration.Text = timeline.MaxSeekTime.ToString(timeline.MaxSeekTime.Hours > 0 ? @"hh\:mm\:ss" : @"mm\:ss");
-                    }
-                }
-            }
+            int visibleRows = Math.Clamp(Math.Max(1, validSessions.Count), 1, 5);
+            double cardHeight = MediaSessionControl.GetCardHeight(SettingsManager.Current.CompactLayout);
+            Height = cardHeight * visibleRows + 12;
         });
+
+        _flyoutMetadataCts?.Cancel();
+        _flyoutMetadataCts?.Dispose();
+        _flyoutMetadataCts = null;
+
+        if (activePairs.Count == 0)
+            return;
+
+        _flyoutMetadataCts = new CancellationTokenSource();
+        var token = _flyoutMetadataCts.Token;
+        string? blurSessionId = activeSession?.Id ?? validSessions[0].Id;
+
+        _ = RefreshFlyoutMetadataAsync(activePairs, blurSessionId, token);
+    }
+
+    private async Task RefreshFlyoutMetadataAsync(
+        List<(MediaSession Session, MediaSessionControl Control)> pairs,
+        string? blurSessionId,
+        CancellationToken token)
+    {
+        try
+        {
+            var tasks = pairs.Select(async pair =>
+            {
+                var controlSession = pair.Session.ControlSession;
+                if (controlSession == null)
+                    return (pair.Session.Id, pair.Control, Title: string.Empty, Artist: string.Empty, Image: (System.Windows.Media.Imaging.BitmapImage?)null, Hash: 0, Accent: (SolidColorBrush?)null);
+
+                GlobalSystemMediaTransportControlsSessionMediaProperties? songInfo = null;
+                try
+                {
+                    songInfo = await controlSession.TryGetMediaPropertiesAsync();
+                }
+                catch (COMException)
+                {
+                    return (pair.Session.Id, pair.Control, Title: string.Empty, Artist: string.Empty, Image: (System.Windows.Media.Imaging.BitmapImage?)null, Hash: 0, Accent: (SolidColorBrush?)null);
+                }
+
+                if (token.IsCancellationRequested || songInfo == null)
+                    return (pair.Session.Id, pair.Control, Title: string.Empty, Artist: string.Empty, Image: (System.Windows.Media.Imaging.BitmapImage?)null, Hash: 0, Accent: (SolidColorBrush?)null);
+
+                var (image, hash, accent) = await Task.Run(() => BitmapHelper.GetThumbnailAndAccent(songInfo.Thumbnail), token);
+                return (pair.Session.Id, pair.Control, Title: songInfo.Title ?? string.Empty, Artist: songInfo.Artist ?? string.Empty, Image: image, Hash: hash, Accent: accent);
+            }).ToArray();
+
+            var snapshots = await Task.WhenAll(tasks);
+            if (token.IsCancellationRequested)
+                return;
+
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (token.IsCancellationRequested)
+                    return;
+
+                foreach (var snap in snapshots)
+                {
+                    if (!_sessionControls.TryGetValue(snap.Id, out var currentControl) || !ReferenceEquals(currentControl, snap.Control))
+                        continue;
+
+                    snap.Control.ApplyMediaMetadata(snap.Title, snap.Artist, snap.Image, snap.Hash, snap.Accent);
+
+                    if (snap.Id == blurSessionId)
+                    {
+                        UpdateFlyoutBackgroundBlur(snap.Id, snap.Image, snap.Hash);
+                    }
+                }
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            // superseded by a newer update
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex, "Failed refreshing flyout session metadata");
+        }
     }
 
     private void UpdateUILayout() // update the layout based on the settings
     {
         Dispatcher.Invoke(() =>
         {
-            int extraWidth = SettingsManager.Current.RepeatEnabled ? 36 : 0;
-            extraWidth += SettingsManager.Current.ShuffleEnabled ? 36 : 0;
-            extraWidth += SettingsManager.Current.PlayerInfoEnabled ? 90 : 0;
-            // keep minimum width at 72 even if all extra features are disabled to prevent the widget from being too small
-            extraWidth = Math.Max(extraWidth, 72);
+            bool compact = SettingsManager.Current.CompactLayout;
+            Width = MediaSessionControl.GetFlyoutWidth(compact);
 
-            int extraHeight = SettingsManager.Current.SeekbarEnabled && _mediaSessionSupportsSeekbar ? 36 : 0;
-
-            if (SettingsManager.Current.CompactLayout) // compact layout
+            for (int i = 0; i < MediaSessionsStackPanel.Children.Count; i++)
             {
-                Height = 60 + extraHeight;
-                Width = 400;
-                BodyStackPanel.Orientation = Orientation.Horizontal;
-                BodyStackPanel.Width = 300;
-                ControlsStackPanelContainer.Margin = new Thickness(2, 0, 0, 0);
-                ControlsStackPanelContainer.Width = 104;
-                ControlsStackPanelContainer.HorizontalAlignment = HorizontalAlignment.Left;
-                ControlsStackPanel.HorizontalAlignment = HorizontalAlignment.Left;
-                MediaIdButton.Visibility = Visibility.Collapsed;
-                SongImageBorder.Margin = new Thickness(0);
-                SongImageBorder.Height = 36;
-                SongInfoStackPanel.Margin = new Thickness(8, 0, 0, 0);
-                SongInfoStackPanel.Width = 182;
-                if (SettingsManager.Current.MediaFlyoutAlwaysDisplay)
+                if (MediaSessionsStackPanel.Children[i] is MediaSessionControl card)
                 {
-                    SongInfoStackPanel.Width -= 36;
-                    ControlsStackPanelContainer.Width += 44;
+                    card.ApplyLayout(isPrimaryCard: i == 0);
                 }
             }
-            else // normal layout
-            {
-                bool centerControlsWithSongInfo = SettingsManager.Current.CenterTitleArtist && !SettingsManager.Current.PlayerInfoEnabled;
-                Height = 112 + extraHeight;
-                Width = 310 - 72 + extraWidth;
-                BodyStackPanel.Orientation = Orientation.Vertical;
-                BodyStackPanel.Width = 194 - 72 + extraWidth;
-                ControlsStackPanelContainer.Margin = new Thickness(8, 8, 0, 0);
-                ControlsStackPanelContainer.Width = double.NaN;
-                ControlsStackPanelContainer.HorizontalAlignment = HorizontalAlignment.Stretch;
-                ControlsStackPanel.HorizontalAlignment = centerControlsWithSongInfo ? HorizontalAlignment.Center : HorizontalAlignment.Left;
-                MediaIdButton.Visibility = Visibility.Visible;
-                SongImageBorder.Margin = new Thickness(6);
-                SongImageBorder.Height = 82;
-                SongInfoStackPanel.Margin = new Thickness(8, 0, 0, 0);
-                SongInfoStackPanel.Width = 182 - 72 + extraWidth;
-            }
-
-            var alignment = SettingsManager.Current.CenterTitleArtist ? HorizontalAlignment.Center : HorizontalAlignment.Left;
-            SongTitle.HorizontalAlignment = alignment;
-            SongArtist.HorizontalAlignment = alignment;
-
-            SeekbarWrapper.Visibility = SettingsManager.Current.SeekbarEnabled ? Visibility.Visible : Visibility.Collapsed;
         });
 
         _layout = SettingsManager.Current.CompactLayout;
@@ -1394,160 +1418,7 @@ public partial class MainWindow : MicaWindow
         _shuffleEnabled = SettingsManager.Current.ShuffleEnabled;
         _playerInfoEnabled = SettingsManager.Current.PlayerInfoEnabled;
         _centerTitleArtist = SettingsManager.Current.CenterTitleArtist;
-        _seekBarEnabled = SettingsManager.Current.SeekbarEnabled;
         _alwaysDisplay = SettingsManager.Current.MediaFlyoutAlwaysDisplay;
-    }
-
-    private async void MediaIdButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (!SettingsManager.Current.PlayerInfoEnabled || SettingsManager.Current.CompactLayout) return;
-        e.Handled = true;
-
-        if (e.OriginalSource is ToggleButton dropdownButton)
-        {
-            ShowSessionSwitcherMenu();
-            return;
-        }
-
-        _ = TryOpenMediaPlayerAsync();
-    }
-
-    private async void Back_Click(object sender, RoutedEventArgs e)
-    {
-        _ = TrySkipPreviousAsync();
-    }
-
-    private async void PlayPause_Click(object sender, RoutedEventArgs e)
-    {
-        _ = TryTogglePlayPauseAsync();
-    }
-
-    private async void Forward_Click(object sender, RoutedEventArgs e)
-    {
-        _ = TrySkipNextAsync();
-    }
-
-    private async void Repeat_Click(object sender, RoutedEventArgs e)
-    {
-        var activeSession = GetActiveMediaSession();
-        if (activeSession == null) return;
-
-        if (activeSession.ControlSession.GetPlaybackInfo().AutoRepeatMode == global::Windows.Media.MediaPlaybackAutoRepeatMode.None)
-        {
-            SymbolRepeat.Dispatcher.Invoke(() => SymbolRepeat.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowRepeatAll24);
-            await activeSession.ControlSession.TryChangeAutoRepeatModeAsync(global::Windows.Media.MediaPlaybackAutoRepeatMode.List);
-        }
-        else if (activeSession.ControlSession.GetPlaybackInfo().AutoRepeatMode == global::Windows.Media.MediaPlaybackAutoRepeatMode.List)
-        {
-            SymbolRepeat.Dispatcher.Invoke(() => SymbolRepeat.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowRepeat124);
-            await activeSession.ControlSession.TryChangeAutoRepeatModeAsync(global::Windows.Media.MediaPlaybackAutoRepeatMode.Track);
-        }
-        else if (activeSession.ControlSession.GetPlaybackInfo().AutoRepeatMode == global::Windows.Media.MediaPlaybackAutoRepeatMode.Track)
-        {
-            SymbolRepeat.Dispatcher.Invoke(() => SymbolRepeat.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowRepeatAllOff24);
-            await activeSession.ControlSession.TryChangeAutoRepeatModeAsync(global::Windows.Media.MediaPlaybackAutoRepeatMode.None);
-        }
-    }
-
-    private async void Shuffle_Click(object sender, RoutedEventArgs e)
-    {
-        var activeSession = GetActiveMediaSession();
-        if (activeSession == null) return;
-
-        if (activeSession.ControlSession.GetPlaybackInfo().IsShuffleActive == true)
-        {
-            SymbolShuffle.Dispatcher.Invoke(() => SymbolShuffle.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowShuffleOff24);
-            await activeSession.ControlSession.TryChangeShuffleActiveAsync(false);
-        }
-        else
-        {
-            SymbolShuffle.Dispatcher.Invoke(() => SymbolShuffle.Symbol = Wpf.Ui.Controls.SymbolRegular.ArrowShuffle24);
-            await activeSession.ControlSession.TryChangeShuffleActiveAsync(true);
-        }
-    }
-
-    private void Seekbar_OnPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (_isDragging) return;
-        _isDragging = true;
-
-        Slider slider = (Slider)sender;
-        System.Windows.Point clickPosition = e.GetPosition(slider);
-        double thumbWidth = slider.Template.FindName("Thumb", slider) is Thumb thumb ? thumb.ActualWidth : 0;
-        double ratio = (clickPosition.X - thumbWidth / 2) / (slider.ActualWidth - thumbWidth);
-        ratio = Math.Max(0, Math.Min(1, ratio));
-        double targetSeconds = ratio * slider.Maximum;
-        // Bug: if the position is 0, then it will cause the position to not change when changing playback position
-        if (targetSeconds == 0) targetSeconds = 1;
-        Dispatcher.Invoke(() =>
-        {
-            Seekbar.Value = TimeSpan.FromSeconds(targetSeconds).TotalSeconds;
-        });
-    }
-
-    private async void Seekbar_OnPreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-    {
-        if (GetActiveMediaSession() is { } session)
-        {
-            var seekPosition = TimeSpan.FromSeconds(Seekbar.Value);
-            if (seekPosition == TimeSpan.Zero) seekPosition = TimeSpan.FromSeconds(1);
-            await session.ControlSession.TryChangePlaybackPositionAsync(seekPosition.Ticks);
-        }
-        _isDragging = false;
-    }
-
-    private void Seekbar_OnValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
-    {
-        if (!_isDragging) return;
-        var timespan = TimeSpan.FromSeconds(e.NewValue);
-        Dispatcher.Invoke(() =>
-        {
-            SeekbarCurrentDuration.Text = timespan.ToString(timespan.Hours > 0 ? @"hh\:mm\:ss" : @"mm\:ss");
-        });
-    }
-
-    private void SeekbarUpdateUi(object? sender)
-    {
-        if (DateTime.Now.Subtract(_lastSelfUpdateTimestamp).TotalSeconds < 1) return;
-
-        if (!_seekBarEnabled || Visibility != Visibility.Visible || _isDragging) return;
-        if (GetActiveMediaSession() is not { } session) return;
-
-        var timeline = session.ControlSession.GetTimelineProperties();
-        var pos = timeline.Position + (DateTime.Now - timeline.LastUpdatedTime.DateTime);
-        if (pos > timeline.EndTime)
-        {
-            HandlePlayBackState(GlobalSystemMediaTransportControlsSessionPlaybackStatus.Closed);
-            return;
-        }
-
-        UpdateSeekbarCurrentDuration(pos);
-    }
-
-    private void UpdateSeekbarCurrentDuration(TimeSpan pos)
-    {
-        Dispatcher.Invoke(() =>
-        {
-            Seekbar.Value = pos.TotalSeconds;
-            SeekbarCurrentDuration.Text = pos.ToString(pos.Hours > 0 ? @"hh\:mm\:ss" : @"mm\:ss");
-        });
-    }
-
-    private void HandlePlayBackState(GlobalSystemMediaTransportControlsSessionPlaybackStatus? status)
-    {
-        if (status == null) return;
-        if (status == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
-        {
-            if (_isActive) return;
-            _isActive = true;
-            _positionTimer.Change(0, _seekbarUpdateInterval);
-        }
-        else
-        {
-            if (!_isActive) return;
-            _isActive = false;
-            _positionTimer.Change(Timeout.Infinite, Timeout.Infinite);
-        }
     }
 
     private void CleanupResources()
@@ -1574,14 +1445,18 @@ public partial class MainWindow : MicaWindow
             // unsubscribe from events
             mediaManager.OnAnyMediaPropertyChanged -= MediaManager_OnAnyMediaPropertyChanged;
             mediaManager.OnAnyPlaybackStateChanged -= CurrentSession_OnPlaybackStateChanged;
-            mediaManager.OnAnyTimelinePropertyChanged -= MediaManager_OnAnyTimelinePropertyChanged;
             mediaManager.OnAnySessionClosed -= MediaManager_OnAnySessionClosed;
 
             DisposeHeadsetControls();
 
             // dispose managed resources
-            _positionTimer?.Change(Timeout.Infinite, Timeout.Infinite);
-            _positionTimer?.Dispose();
+            _flyoutMetadataCts?.Cancel();
+            _flyoutMetadataCts?.Dispose();
+            foreach (var control in _sessionControls.Values)
+            {
+                DetachSessionControl(control);
+            }
+            _sessionControls.Clear();
             cts?.Cancel();
             cts?.Dispose();
 
