@@ -25,6 +25,18 @@ Zen Browser only exposes one process-wide Windows SMTC session by default. To ex
 3. Place `config.js` (registers `resource://fluentflyout/` and loads the bridge into browser windows) and `fluentflyout-zen-bridge.js` (tracks `browser.browsingContext.mediaController` per tab and syncs over WebSocket) in the Zen Browser installation root.
 4. Restart Zen Browser completely once so AutoConfig activates.
 
+### VLC Media Player Setup
+VLC does not expose a native Windows SMTC session, so this fork polls VLC's local HTTP interface (`127.0.0.1:42129`). On a fresh VLC installation, enable it in `%APPDATA%\vlc\vlcrc`:
+1. Close VLC completely.
+2. Open `%APPDATA%\vlc\vlcrc` and set/uncomment:
+   ```ini
+   extraintf=http
+   http-host=127.0.0.1
+   http-port=42129
+   http-password=fluentflyout
+   ```
+3. Restart VLC.
+
 ---
 
 <p align="center">
