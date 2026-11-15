@@ -1,3 +1,33 @@
+# 👽👽👽 Fork: FluentFlyout with Multi-Session & Zen Browser Support
+
+This is a custom fork of the original FluentFlyout project. Compared to the main repository, this fork includes:
+
+<p align="center">
+	<img alt="FluentFlyout multi-session flyout sample" src="sample.png" />
+</p>
+- **Multiple Media Sessions Flyout:** Stacks and displays all active media sessions simultaneously in the flyout (no dropdown or internal scrollbar), smoothly resizing height to fit.
+- **Zen Browser Multi-Tab Support:** Exposes each active media tab in Zen Browser individually (e.g. YouTube, Spotify, YouTube Music) instead of collapsing them into a single `Zen Browser` session.
+- **VLC Media Player Integration:** Displays active VLC playback, video/file thumbnails, and controls (`Play/Pause`, `Prev`, `Next`, `-5s`/`+5s`, `Repeat`, `Shuffle`) via VLC's local HTTP interface (`127.0.0.1:42129`).
+- **Scrollable Taskbar Widget:** Cycle through multiple active media sessions by scrolling over the taskbar widget.
+- **Taskbar Persistence:** Keeps the last active media session visible on the taskbar widget when paused/idle so you can resume directly.
+- **Flyout Seek Controls (`-5s` / `+5s`):** Added 5-second rewind and fast-forward buttons to each session card.
+- **Cleaner Compact Layout:** Removed the player source badge button (`MediaIdButton`) from each card and scaled the flyout width to fit the remaining controls cleanly.
+- **BUG FIX — Windhawk `Taskbar Auto-Hide Instant Show` Compatibility:** Correctly renders the taskbar widget inside the taskbar without glitchy, clipped, or off-screen positioning.
+
+### Zen Browser Multi-Tab Setup
+Zen Browser only exposes one process-wide Windows SMTC session by default. To expose each media tab individually to this fork's loopback bridge (`ws://127.0.0.1:27415/`):
+1. Open your Zen Browser installation directory (e.g. `D:\apps\Zen Browser\` or `C:\Program Files\Zen Browser\`).
+2. Create `defaults\pref\config-prefs.js` with:
+   ```js
+   pref("general.config.filename", "config.js");
+   pref("general.config.obscure_value", 0);
+   pref("general.config.sandbox_enabled", false);
+   ```
+3. Place `config.js` (registers `resource://fluentflyout/` and loads the bridge into browser windows) and `fluentflyout-zen-bridge.js` (tracks `browser.browsingContext.mediaController` per tab and syncs over WebSocket) in the Zen Browser installation root.
+4. Restart Zen Browser completely once so AutoConfig activates.
+
+---
+
 <p align="center">
 	<picture>
 		<source width="65%" alt="fluentflyout-title" media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/daa2969f-8ad2-4832-8253-26133a50c921" />

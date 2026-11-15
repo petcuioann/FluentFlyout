@@ -2,20 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 using FluentFlyout.Classes.Settings;
-using FluentFlyout.Classes.Utils;
+using FluentFlyoutWPF.Classes.Media;
+using FluentFlyoutWPF.Classes.Services;
 using System.Windows;
 using System.Windows.Media;
-using Windows.Media.Control;
-using static WindowsMediaController.MediaManager;
 
 namespace FluentFlyoutWPF;
 
 public partial class MainWindow
 {
-    public IReadOnlyList<MediaSession> GetSwitchableSessions()
-    {
-        return mediaManager.CurrentMediaSessions.Values.Where(IsSessionAllowed).ToList();
-    }
+    public IReadOnlyList<IMediaPlaybackSession> GetSwitchableSessions() => GetAllowedPlaybackSessions();
 
     public void PinSession(string? sessionId)
     {
@@ -65,18 +61,27 @@ public partial class MainWindow
 
         foreach (var session in sessions)
         {
-            string sessionId = session.Id ?? string.Empty;
-            (string appName, ImageSource? appIcon) = MediaPlayerData.GetAndCacheMediaPlayerData(sessionId);
+            string sessionId = session.Id;
+            string appName = session.SourceAppName;
+            ImageSource? appIcon = session.SourceAppIcon;
+            bool isPlaying = session.IsPlaying;
 
             string trackLabel = string.Empty;
-            bool isPlaying = false;
             try
             {
-                if (session.ControlSession != null)
+                if (session is ZenMediaPlaybackSession zenSession)
                 {
-                    isPlaying = session.ControlSession.GetPlaybackInfo()?.PlaybackStatus
-                        == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
-                    var props = TryGetMediaProperties(session.ControlSession);
+                    if (!string.IsNullOrWhiteSpace(zenSession.Title) || !string.IsNullOrWhiteSpace(zenSession.Artist))
+                        trackLabel = string.IsNullOrWhiteSpace(zenSession.Artist) ? zenSession.Title : $"{zenSession.Title} - {zenSession.Artist}";
+                }
+                else if (session is VlcMediaPlaybackSession vlcSession)
+                {
+                    if (!string.IsNullOrWhiteSpace(vlcSession.Title) || !string.IsNullOrWhiteSpace(vlcSession.Artist))
+                        trackLabel = string.IsNullOrWhiteSpace(vlcSession.Artist) ? vlcSession.Title : $"{vlcSession.Title} - {vlcSession.Artist}";
+                }
+                else if (session is SmtcMediaPlaybackSession smtcSession && smtcSession.RawSession.ControlSession != null)
+                {
+                    var props = TryGetMediaProperties(smtcSession.RawSession.ControlSession);
                     if (props != null && (!string.IsNullOrWhiteSpace(props.Title) || !string.IsNullOrWhiteSpace(props.Artist)))
                         trackLabel = string.IsNullOrWhiteSpace(props.Artist) ? props.Title : $"{props.Title} - {props.Artist}";
                 }

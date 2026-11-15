@@ -4,7 +4,9 @@
 using FluentFlyout.Classes.Settings;
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
 using System.Security.Cryptography;
+using System.Text;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -202,6 +204,108 @@ internal static class BitmapHelper
 
         var brushes = ExtractDominantColorsInternal(hashCode, image, 1, 15);
         return (image, hashCode, brushes.FirstOrDefault());
+    }
+
+    private static readonly HttpClient _httpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(5)
+    };
+
+    private static BitmapImage? DecodeBitmapFromBytes(byte[] bytes, int decodePixelWidth)
+    {
+        if (bytes.Length == 0)
+            return null;
+
+        using MemoryStream ms = new(bytes, writable: false);
+        BitmapImage image = new();
+        image.BeginInit();
+        image.CacheOption = BitmapCacheOption.OnLoad;
+        image.DecodePixelWidth = decodePixelWidth;
+        image.StreamSource = ms;
+        image.EndInit();
+        image.Freeze();
+        return image;
+    }
+
+    internal static BitmapImage? DecodeDataUrl(string? dataUrl, int decodePixelWidth = 32)
+    {
+        if (string.IsNullOrWhiteSpace(dataUrl) || !dataUrl.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        try
+        {
+            int commaIdx = dataUrl.IndexOf(',');
+            if (commaIdx <= 0)
+                return null;
+
+            string header = dataUrl[..commaIdx];
+            if (!header.Contains(";base64", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            byte[] bytes = Convert.FromBase64String(dataUrl[(commaIdx + 1)..]);
+            return DecodeBitmapFromBytes(bytes, decodePixelWidth);
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug(ex, "Failed to decode data URL image");
+            return null;
+        }
+    }
+
+    internal static async Task<(BitmapImage? Image, int HashCode, SolidColorBrush? AccentBrush)> GetThumbnailAndAccentFromUrlAsync(
+        string? artworkUrl,
+        CancellationToken token,
+        int maxThumbnailSize = _maxThumbnailSize)
+    {
+        if (string.IsNullOrWhiteSpace(artworkUrl))
+            return (null, 0, null);
+
+        try
+        {
+            byte[] urlHash = SHA256.HashData(Encoding.UTF8.GetBytes(artworkUrl));
+            int hashCode = BitConverter.ToInt32(urlHash, 0);
+            if (hashCode == 0)
+                hashCode = 1;
+
+            if (!_thumbnailCache.TryGetValue(hashCode, out var image) || image == null)
+            {
+                if (artworkUrl.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                {
+                    image = DecodeDataUrl(artworkUrl, maxThumbnailSize);
+                }
+                else if (Uri.TryCreate(artworkUrl, UriKind.Absolute, out var uri) &&
+                         (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+                {
+                    using var response = await _httpClient.GetAsync(uri, HttpCompletionOption.ResponseContentRead, token).ConfigureAwait(false);
+                    if (!response.IsSuccessStatusCode)
+                        return (null, 0, null);
+
+                    byte[] bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                    image = DecodeBitmapFromBytes(bytes, maxThumbnailSize);
+                }
+
+                if (image == null)
+                    return (null, 0, null);
+
+                _thumbnailCache.Set(hashCode, image);
+            }
+
+            if (!SettingsManager.Current.UseAlbumArtAsAccentColor)
+                return (image, hashCode, null);
+
+            var brushes = ExtractDominantColorsInternal(hashCode, image, 1, 15);
+            return (image, hashCode, brushes.FirstOrDefault());
+        }
+        catch (OperationCanceledException)
+        {
+            return (null, 0, null);
+        }
+        catch (Exception ex)
+        {
+            Logger.Info(ex, "Failed to load thumbnail image from URL");
+            return (null, 0, null);
+        }
     }
 
     internal static CroppedBitmap? CropToSquare(BitmapImage? sourceImage)

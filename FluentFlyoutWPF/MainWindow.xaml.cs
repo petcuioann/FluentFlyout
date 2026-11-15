@@ -7,6 +7,7 @@ using FluentFlyout.Classes.Utils;
 using FluentFlyout.Controls;
 using FluentFlyout.Windows;
 using FluentFlyoutWPF.Classes;
+using FluentFlyoutWPF.Classes.Media;
 using FluentFlyoutWPF.Classes.Services;
 using FluentFlyoutWPF.Classes.Utils;
 using FluentFlyoutWPF.Controls;
@@ -47,6 +48,8 @@ public partial class MainWindow : MicaWindow
     private long _lastFlyoutTime = 0;
 
     public readonly WindowsMediaController.MediaManager mediaManager = new();
+    private readonly ZenBridgeService _zenBridgeService = new();
+    private readonly VlcBridgeService _vlcBridgeService = new();
 
     // for detecting changes in settings (lazy way)
     private int _position = SettingsManager.Current.Position;
@@ -174,6 +177,10 @@ public partial class MainWindow : MicaWindow
         cts = new CancellationTokenSource();
 
         mediaManager.Start();
+        _zenBridgeService.SessionsChanged += ZenBridge_SessionsChanged;
+        _zenBridgeService.Start();
+        _vlcBridgeService.SessionChanged += VlcBridge_SessionChanged;
+        _vlcBridgeService.Start();
 
         _hookProc = HookCallback;
         _hookId = SetHook(_hookProc);
@@ -273,10 +280,14 @@ public partial class MainWindow : MicaWindow
     public bool IsSessionAllowed(MediaSession? session)
     {
         if (session == null) return false;
-        if (!SettingsManager.Current.AppFilteringEnabled) return true;
-
         string appId = session.Id ?? string.Empty;
         string appName = MediaPlayerData.GetAndCacheMediaPlayerData(appId).Item1 ?? appId;
+        return IsSessionAllowed(appName, appId);
+    }
+
+    public bool IsSessionAllowed(string appName, string appId)
+    {
+        if (!SettingsManager.Current.AppFilteringEnabled) return true;
 
         if (SettingsManager.Current.AppFilteringMode == 0) // Blacklist mode
         {
@@ -294,6 +305,42 @@ public partial class MainWindow : MicaWindow
 
             return false;
         }
+    }
+
+    public IReadOnlyList<IMediaPlaybackSession> GetAllowedPlaybackSessions()
+    {
+        var rawZenSessions = _zenBridgeService.GetSessions();
+        bool hasZenSessions = rawZenSessions.Count > 0;
+
+        List<IMediaPlaybackSession> sessions = [];
+        foreach (var zenSession in rawZenSessions)
+        {
+            if (IsSessionAllowed(zenSession.SourceAppName, zenSession.Id))
+                sessions.Add(zenSession);
+        }
+
+        if (_vlcBridgeService.GetSession() is { } vlcSession &&
+            IsSessionAllowed(vlcSession.SourceAppName, vlcSession.Id))
+        {
+            sessions.Add(vlcSession);
+        }
+
+        foreach (var smtcSession in mediaManager.CurrentMediaSessions.Values)
+        {
+            // Suppress generic single-process zen.exe SMTC (including Mozilla AUMID hashes resolved to "Zen Browser") whenever live Zen tab sessions are available
+            if (hasZenSessions)
+            {
+                string smtcAppName = MediaPlayerData.GetAndCacheMediaPlayerData(smtcSession.Id).Item1 ?? string.Empty;
+                if (smtcSession.Id.Contains("zen", StringComparison.OrdinalIgnoreCase) ||
+                    smtcAppName.Contains("zen", StringComparison.OrdinalIgnoreCase))
+                    continue;
+            }
+
+            if (IsSessionAllowed(smtcSession))
+                sessions.Add(new SmtcMediaPlaybackSession(smtcSession));
+        }
+
+        return sessions;
     }
 
     // display names are matched in full: entries always hold a whole app name, and a substring match let one entry
@@ -327,10 +374,8 @@ public partial class MainWindow : MicaWindow
 
     public void CycleActiveMediaSession(int direction)
     {
-        var validSessions = mediaManager.CurrentMediaSessions.Values.Where(IsSessionAllowed).ToList();
-        var playingSessions = validSessions
-            .Where(s => s.ControlSession?.GetPlaybackInfo()?.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
-            .ToList();
+        var validSessions = GetAllowedPlaybackSessions().ToList();
+        var playingSessions = validSessions.Where(s => s.IsPlaying).ToList();
 
         var cycleList = playingSessions.Count >= 2
             ? playingSessions
@@ -353,9 +398,9 @@ public partial class MainWindow : MicaWindow
             UpdateUI(nextSession);
     }
 
-    public MediaSession? GetActiveMediaSession()
+    public IMediaPlaybackSession? GetActiveMediaSession()
     {
-        var validSessions = mediaManager.CurrentMediaSessions.Values.Where(IsSessionAllowed).ToList();
+        var validSessions = GetAllowedPlaybackSessions();
 
         if (validSessions.Count == 0) return null;
 
@@ -383,11 +428,23 @@ public partial class MainWindow : MicaWindow
         }
 
         var focused = mediaManager.GetFocusedSession();
-        if (focused != null && validSessions.Any(s => s.Id == focused.Id))
-            return focused;
+        if (focused != null)
+        {
+            var focusedSession = validSessions.FirstOrDefault(s => s.Id == focused.Id);
+            if (focusedSession != null)
+                return focusedSession;
+        }
 
         return validSessions.FirstOrDefault();
     }
+
+    private static int? GetVolumeProcessId(IMediaPlaybackSession session)
+        => MediaPlayerData.GetAndCacheProcessId(session switch
+        {
+            ZenMediaPlaybackSession => "zen.exe",
+            VlcMediaPlaybackSession => "vlc.exe",
+            _ => session.Id
+        });
 
     public float? GetActiveMediaAppVolume()
     {
@@ -395,7 +452,7 @@ public partial class MainWindow : MicaWindow
             GetActiveMediaSession() is not { } activeSession)
             return null;
 
-        int? processId = MediaPlayerData.GetAndCacheProcessId(activeSession.Id);
+        int? processId = GetVolumeProcessId(activeSession);
         return processId.HasValue
             ? volumeMixerViewModel.GetSessionVolume(processId.Value)
             : null;
@@ -418,7 +475,7 @@ public partial class MainWindow : MicaWindow
             case 2:
                 if (GetActiveMediaSession() is not { } activeSession) return;
 
-                int? processId = MediaPlayerData.GetAndCacheProcessId(activeSession.Id);
+                int? processId = GetVolumeProcessId(activeSession);
                 if (processId.HasValue)
                 {
                     volumeMixerViewModel.TryAdjustSessionVolume(processId.Value, delta);
@@ -438,25 +495,13 @@ public partial class MainWindow : MicaWindow
     }
 
     public async Task<bool> TrySkipPreviousAsync()
-    {
-        var focusedSession = GetActiveMediaSession();
-        if (focusedSession == null) return false;
-        return await focusedSession.ControlSession.TrySkipPreviousAsync();
-    }
+        => GetActiveMediaSession() is { } session && await session.TrySkipPreviousAsync();
 
     public async Task<bool> TryTogglePlayPauseAsync()
-    {
-        var focusedSession = GetActiveMediaSession();
-        if (focusedSession == null) return false;
-        return await focusedSession.ControlSession.TryTogglePlayPauseAsync();
-    }
+        => GetActiveMediaSession() is { } session && await session.TryTogglePlayPauseAsync();
 
     public async Task<bool> TrySkipNextAsync()
-    {
-        var focusedSession = GetActiveMediaSession();
-        if (focusedSession == null) return false;
-        return await focusedSession.ControlSession.TrySkipNextAsync();
-    }
+        => GetActiveMediaSession() is { } session && await session.TrySkipNextAsync();
 
     public async Task<bool> TryOpenMediaPlayerAsync()
     {
@@ -464,8 +509,14 @@ public partial class MainWindow : MicaWindow
         {
             if (GetActiveMediaSession() is { } activeSession)
             {
-                var mediaProperties = TryGetMediaProperties(activeSession.ControlSession);
-                return await Task.Run(() => MediaPlayerData.TryActivateMediaPlayer(activeSession.Id, mediaProperties?.Title));
+                string? title = activeSession switch
+                {
+                    SmtcMediaPlaybackSession smtc => TryGetMediaProperties(smtc.RawSession.ControlSession)?.Title,
+                    ZenMediaPlaybackSession zen => zen.Title,
+                    VlcMediaPlaybackSession vlc => vlc.Title,
+                    _ => null
+                };
+                return await activeSession.TryActivateAsync(title);
             }
         }
         catch (Exception ex)
@@ -755,20 +806,90 @@ public partial class MainWindow : MicaWindow
     public void UpdateTaskbar()
     {
         var activeSession = GetActiveMediaSession();
-        if (!mediaManager.IsStarted || activeSession == null)
+        if (activeSession == null)
         {
             taskbarWindow?.UpdateUi("-", "-", null, GlobalSystemMediaTransportControlsSessionPlaybackStatus.Closed);
             return;
         }
 
-        var songInfo = TryGetMediaProperties(activeSession.ControlSession);
-        if (songInfo == null)
-            return;
+        if (activeSession is SmtcMediaPlaybackSession smtcSession)
+        {
+            if (!mediaManager.IsStarted || smtcSession.RawSession.ControlSession == null)
+            {
+                taskbarWindow?.UpdateUi("-", "-", null, GlobalSystemMediaTransportControlsSessionPlaybackStatus.Closed);
+                return;
+            }
 
-        var playbackInfo = activeSession.ControlSession.GetPlaybackInfo();
-        var thumbnail = BitmapHelper.GetThumbnail(songInfo.Thumbnail);
-        BitmapHelper.GetDominantColors(1);
-        taskbarWindow?.UpdateUi(songInfo.Title, songInfo.Artist, thumbnail, playbackInfo.PlaybackStatus, playbackInfo.Controls);
+            var songInfo = TryGetMediaProperties(smtcSession.RawSession.ControlSession);
+            if (songInfo == null)
+                return;
+
+            var playbackInfo = smtcSession.RawSession.ControlSession.GetPlaybackInfo();
+            var thumbnail = BitmapHelper.GetThumbnail(songInfo.Thumbnail);
+            BitmapHelper.GetDominantColors(1);
+            taskbarWindow?.UpdateUi(songInfo.Title, songInfo.Artist, thumbnail, playbackInfo.PlaybackStatus, playbackInfo.Controls);
+        }
+        else
+        {
+            var (title, artist, artUrl, status, sessionId) = activeSession switch
+            {
+                ZenMediaPlaybackSession z => (z.Title, z.Artist, z.ArtworkUrl, z.PlaybackStatus, z.Id),
+                VlcMediaPlaybackSession v => (v.Title, v.Artist, v.ArtworkUrl, v.PlaybackStatus, v.Id),
+                _ => (string.Empty, string.Empty, string.Empty, activeSession.PlaybackStatus, activeSession.Id)
+            };
+
+            taskbarWindow?.UpdateUi(title, artist, null, status);
+
+            if (!string.IsNullOrEmpty(artUrl))
+            {
+                _ = Task.Run(async () =>
+                {
+                    var (img, _, _) = await BitmapHelper.GetThumbnailAndAccentFromUrlAsync(artUrl, CancellationToken.None).ConfigureAwait(false);
+                    if (img == null) return;
+
+                    _ = Dispatcher.BeginInvoke(() =>
+                    {
+                        if (GetActiveMediaSession() is { } current && current.Id == sessionId)
+                        {
+                            taskbarWindow?.UpdateUi(title, artist, img, current.PlaybackStatus);
+                        }
+                    });
+                });
+            }
+        }
+    }
+
+    private void VlcBridge_SessionChanged(string newlyPlayingId)
+    {
+        if (!string.IsNullOrEmpty(newlyPlayingId))
+            ZenBridge_SessionsChanged([newlyPlayingId]);
+        else
+            ZenBridge_SessionsChanged([]);
+    }
+
+    private void ZenBridge_SessionsChanged(IReadOnlyList<string> updatedIds)
+    {
+        _ = Dispatcher.BeginInvoke(() =>
+        {
+            if (_isCleaningUp) return;
+
+            var allowedSessions = GetAllowedPlaybackSessions();
+            foreach (string id in updatedIds)
+            {
+                var updated = allowedSessions.FirstOrDefault(s => s.Id == id);
+                if (updated != null && updated.IsPlaying)
+                {
+                    PromoteSessionHistory(updated.Id);
+                    pauseOtherMediaSessionsIfNeeded(updated);
+                }
+            }
+
+            UpdateTaskbar();
+            if (IsVisible)
+            {
+                UpdateUI(GetActiveMediaSession());
+            }
+        });
     }
 
     public void reportBug(object? sender, EventArgs e)
@@ -801,12 +922,9 @@ public partial class MainWindow : MicaWindow
         }
     }
 
-    private void pauseOtherMediaSessionsIfNeeded(MediaSession mediaSession)
+    private void pauseOtherMediaSessionsIfNeeded(IMediaPlaybackSession mediaSession)
     {
-        if (
-            SettingsManager.Current.PauseOtherSessionsEnabled
-            && mediaSession.ControlSession.GetPlaybackInfo().PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing
-            )
+        if (SettingsManager.Current.PauseOtherSessionsEnabled && mediaSession.IsPlaying)
         {
             PauseOtherSessions(mediaSession);
         }
@@ -818,7 +936,8 @@ public partial class MainWindow : MicaWindow
 #if DEBUG
         Logger.Debug("Playback state changed: " + mediaSession.Id + " " + newStatus);
 #endif
-        pauseOtherMediaSessionsIfNeeded(mediaSession);
+        var wrapped = new SmtcMediaPlaybackSession(mediaSession);
+        pauseOtherMediaSessionsIfNeeded(wrapped);
 
         if (newStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
         {
@@ -830,10 +949,8 @@ public partial class MainWindow : MicaWindow
 
             if (GetActiveMediaSession()?.Id == mediaSession.Id)
             {
-                var otherPlaying = mediaManager.CurrentMediaSessions.Values
-                    .Where(IsSessionAllowed)
-                    .FirstOrDefault(s => s.Id != mediaSession.Id &&
-                        s.ControlSession?.GetPlaybackInfo()?.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing);
+                var otherPlaying = GetAllowedPlaybackSessions()
+                    .FirstOrDefault(s => s.Id != mediaSession.Id && s.IsPlaying);
 
                 if (otherPlaying != null)
                 {
@@ -869,11 +986,17 @@ public partial class MainWindow : MicaWindow
             return;
         }
 
-        var songInfo = TryGetMediaProperties(currentActiveSession.ControlSession);
+        if (currentActiveSession is not SmtcMediaPlaybackSession smtcActive || smtcActive.RawSession.ControlSession == null)
+        {
+            UpdateTaskbar();
+            return;
+        }
+
+        var songInfo = TryGetMediaProperties(smtcActive.RawSession.ControlSession);
         if (songInfo == null)
             return;
 
-        var playbackInfo = currentActiveSession.ControlSession.GetPlaybackInfo();
+        var playbackInfo = smtcActive.RawSession.ControlSession.GetPlaybackInfo();
 
         string check = currentActiveSession.Id + songInfo.Title + songInfo.Artist + playbackInfo.PlaybackStatus;
         int checkThumbnail = BitmapHelper.GetStableThumbnailHash(songInfo.Thumbnail);
@@ -896,7 +1019,7 @@ public partial class MainWindow : MicaWindow
 
             taskbarWindow?.UpdateUi(songInfo.Title, songInfo.Artist, thumbnail, playbackInfo.PlaybackStatus, playbackInfo.Controls);
 
-            pauseOtherMediaSessionsIfNeeded(mediaSession);
+            pauseOtherMediaSessionsIfNeeded(new SmtcMediaPlaybackSession(mediaSession));
 
             if (SettingsManager.Current.NextUpEnabled && !FullscreenDetector.IsFullscreenApplicationRunning()) // show NextUpWindow if enabled in settings
             {
@@ -1227,7 +1350,7 @@ public partial class MainWindow : MicaWindow
         }
     }
 
-    private void UpdateUI(MediaSession? activeSession)
+    private void UpdateUI(IMediaPlaybackSession? activeSession)
     {
         if (_layout != SettingsManager.Current.CompactLayout ||
             _shuffleEnabled != SettingsManager.Current.ShuffleEnabled ||
@@ -1237,8 +1360,8 @@ public partial class MainWindow : MicaWindow
             _alwaysDisplay != SettingsManager.Current.MediaFlyoutAlwaysDisplay)
             UpdateUILayout();
 
-        List<MediaSession> validSessions = [];
-        List<(MediaSession Session, MediaSessionControl Control)> activePairs = [];
+        List<IMediaPlaybackSession> validSessions = [];
+        List<(IMediaPlaybackSession Session, MediaSessionControl Control)> activePairs = [];
 
         Dispatcher.Invoke(() =>
         {
@@ -1253,7 +1376,7 @@ public partial class MainWindow : MicaWindow
                 ToggleBlur();
             }
 
-            validSessions = mediaManager.CurrentMediaSessions.Values.Where(IsSessionAllowed).ToList();
+            validSessions = GetAllowedPlaybackSessions().ToList();
 
             if (validSessions.Count == 0)
             {
@@ -1310,13 +1433,15 @@ public partial class MainWindow : MicaWindow
                     }
 
                     control.ApplyLayout(isPrimaryCard: i == 0);
-                    control.ApplyPlaybackState(session, session.ControlSession?.GetPlaybackInfo());
+                    control.ApplyPlaybackState(session);
                     activePairs.Add((session, control));
                 }
             }
 
             int visibleRows = Math.Clamp(Math.Max(1, validSessions.Count), 1, 5);
-            double cardHeight = MediaSessionControl.GetCardHeight(SettingsManager.Current.CompactLayout);
+            bool compact = SettingsManager.Current.CompactLayout;
+            Width = MediaSessionControl.GetFlyoutWidth(compact);
+            double cardHeight = MediaSessionControl.GetCardHeight(compact);
             Height = cardHeight * visibleRows + 12;
         });
 
@@ -1335,7 +1460,7 @@ public partial class MainWindow : MicaWindow
     }
 
     private async Task RefreshFlyoutMetadataAsync(
-        List<(MediaSession Session, MediaSessionControl Control)> pairs,
+        List<(IMediaPlaybackSession Session, MediaSessionControl Control)> pairs,
         string? blurSessionId,
         CancellationToken token)
     {
@@ -1343,25 +1468,24 @@ public partial class MainWindow : MicaWindow
         {
             var tasks = pairs.Select(async pair =>
             {
-                var controlSession = pair.Session.ControlSession;
-                if (controlSession == null)
+                var meta = await pair.Session.GetMetadataAsync(token);
+                if (token.IsCancellationRequested)
                     return (pair.Session.Id, pair.Control, Title: string.Empty, Artist: string.Empty, Image: (System.Windows.Media.Imaging.BitmapImage?)null, Hash: 0, Accent: (SolidColorBrush?)null);
 
-                GlobalSystemMediaTransportControlsSessionMediaProperties? songInfo = null;
-                try
+                System.Windows.Media.Imaging.BitmapImage? image = null;
+                int hash = 0;
+                SolidColorBrush? accent = null;
+
+                if (meta.SmtcThumbnail != null)
                 {
-                    songInfo = await controlSession.TryGetMediaPropertiesAsync();
+                    (image, hash, accent) = await Task.Run(() => BitmapHelper.GetThumbnailAndAccent(meta.SmtcThumbnail), token);
                 }
-                catch (COMException)
+                else if (!string.IsNullOrEmpty(meta.ArtworkUrl))
                 {
-                    return (pair.Session.Id, pair.Control, Title: string.Empty, Artist: string.Empty, Image: (System.Windows.Media.Imaging.BitmapImage?)null, Hash: 0, Accent: (SolidColorBrush?)null);
+                    (image, hash, accent) = await BitmapHelper.GetThumbnailAndAccentFromUrlAsync(meta.ArtworkUrl, token);
                 }
 
-                if (token.IsCancellationRequested || songInfo == null)
-                    return (pair.Session.Id, pair.Control, Title: string.Empty, Artist: string.Empty, Image: (System.Windows.Media.Imaging.BitmapImage?)null, Hash: 0, Accent: (SolidColorBrush?)null);
-
-                var (image, hash, accent) = await Task.Run(() => BitmapHelper.GetThumbnailAndAccent(songInfo.Thumbnail), token);
-                return (pair.Session.Id, pair.Control, Title: songInfo.Title ?? string.Empty, Artist: songInfo.Artist ?? string.Empty, Image: image, Hash: hash, Accent: accent);
+                return (pair.Session.Id, pair.Control, meta.Title, meta.Artist, Image: image, Hash: hash, Accent: accent);
             }).ToArray();
 
             var snapshots = await Task.WhenAll(tasks);
@@ -1446,6 +1570,10 @@ public partial class MainWindow : MicaWindow
             mediaManager.OnAnyMediaPropertyChanged -= MediaManager_OnAnyMediaPropertyChanged;
             mediaManager.OnAnyPlaybackStateChanged -= CurrentSession_OnPlaybackStateChanged;
             mediaManager.OnAnySessionClosed -= MediaManager_OnAnySessionClosed;
+            _zenBridgeService.SessionsChanged -= ZenBridge_SessionsChanged;
+            _zenBridgeService.Dispose();
+            _vlcBridgeService.SessionChanged -= VlcBridge_SessionChanged;
+            _vlcBridgeService.Dispose();
 
             DisposeHeadsetControls();
 
@@ -1909,17 +2037,14 @@ public partial class MainWindow : MicaWindow
         else if (SettingsManager.Current.NIconLeftClick == 1) ShowMediaFlyout(withVolume: true);
     }
 
-    private Task PauseOtherSessions(MediaSession currentMediaSession)
+    private Task PauseOtherSessions(IMediaPlaybackSession currentMediaSession)
     {
         return Task.WhenAll(
-            mediaManager.CurrentMediaSessions.Values.Select(session =>
+            GetAllowedPlaybackSessions().Select(session =>
             {
-                if (
-                    session.Id != currentMediaSession.Id &&
-                    session.ControlSession.GetPlaybackInfo().PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing
-                )
+                if (session.Id != currentMediaSession.Id && session.IsPlaying)
                 {
-                    return session.ControlSession.TryPauseAsync().AsTask();
+                    return session.TryTogglePlayPauseAsync();
                 }
                 return Task.CompletedTask;
             })
