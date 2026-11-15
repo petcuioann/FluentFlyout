@@ -5,6 +5,7 @@ This is a custom fork of the original FluentFlyout project. Compared to the main
 <p align="center">
 	<img alt="FluentFlyout multi-session flyout sample" src="sample.png" />
 </p>
+
 - **Multiple Media Sessions Flyout:** Stacks and displays all active and paused media sessions simultaneously in the flyout (no dropdown or internal scrollbar), smoothly resizing height to fit.
 - **Zen Browser Multi-Tab Support:** Exposes each active media tab in Zen Browser individually (e.g. YouTube, Spotify, YouTube Music) instead of collapsing them into a single `Zen Browser` session.
 - **VLC Media Player Integration:** Displays active VLC playback, video/file thumbnails, and controls (`Play/Pause`, `Prev`, `Next`, `-5s`/`+5s`, `Repeat`, `Shuffle`) via VLC's local HTTP interface (`127.0.0.1:42129`).
